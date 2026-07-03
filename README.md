@@ -26,7 +26,9 @@ Count billions of unique values using only kilobytes of memory.
 ### Sketch-Accelerated Queries
 
 ### Confidence-Driven Query Planning
-Using specify the theoretical lower-bound they are willing to accept.
+User specify the theoretical lower-bound they are willing to accept.
+We will only provide these for atomic functions, user will decide what this implicts for their query.
+More about proofs for theoretical lowerbound of each function will be located in folder proofs.
 
 ## Starter Code
 SketchyDB currently has a tiny SQLite-style C API, a shell, and the beginning of
