@@ -27,3 +27,32 @@ Count billions of unique values using only kilobytes of memory.
 
 ### Confidence-Driven Query Planning
 Using specify the theoretical lower-bound they are willing to accept.
+
+## Starter Code
+SketchyDB currently has a tiny SQLite-style C API, a shell, and the beginning of
+a planner/executor split. The exact execution path is designed to run through
+DuckDB, while the approximate path is intentionally empty for the randomized
+algorithm work.
+
+```bash
+make
+make test
+./build/sketchydb :memory:
+```
+
+To compile the exact path against DuckDB, install DuckDB's C library/header and
+build with:
+
+```bash
+make clean
+make SKDB_USE_DUCKDB=1
+```
+
+Current layout:
+
+- `include/sketchydb.h`: public C API, similar in spirit to `sqlite3.h`.
+- `src/sketchydb.cpp`: opaque database handle and API implementation.
+- `src/planner.cpp`: the first decision point for exact vs approximate plans.
+- `src/duckdb_backend.cpp`: exact execution adapter for DuckDB.
+- `shell/shell.cpp`: tiny interactive shell.
+- `tests/test_smoke.cpp`: smoke test for opening, executing, errors, and closing.
