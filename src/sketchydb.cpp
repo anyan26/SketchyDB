@@ -92,7 +92,10 @@ int skdb_exec(
 
     auto plan = db->planner.plan(sql);
     if (plan.mode == sketchydb::ExecutionMode::Approximate) {
-        return set_error(db, error_message, "approximate execution is not implemented yet");
+        return set_error(
+            db,
+            error_message,
+            plan.approximate_function + " is recognized but not implemented yet");
     }
 
     std::string error;

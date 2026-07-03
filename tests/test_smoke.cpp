@@ -22,6 +22,35 @@ int main() {
                "DuckDB support is not compiled in; rebuild with SKDB_USE_DUCKDB=1") == 0);
     skdb_free(error_message);
 #endif
+    error_message = nullptr;
+    rc = skdb_exec(
+        db,
+        "select APPROX_COUNT_DISTINCT(user_id) from events",
+        nullptr,
+        nullptr,
+        &error_message);
+    assert(rc == SKDB_ERROR);
+    assert(error_message != nullptr);
+    assert(std::strcmp(
+               error_message,
+               "approx_count_distinct is recognized but not implemented yet") == 0);
+    skdb_free(error_message);
+
+    error_message = nullptr;
+    rc = skdb_exec(
+        db,
+        "select 'approx_count_distinct(user_id)' as literal",
+        nullptr,
+        nullptr,
+        &error_message);
+#ifdef SKDB_USE_DUCKDB
+    assert(rc == SKDB_OK);
+    assert(error_message == nullptr);
+#else
+    assert(rc == SKDB_ERROR);
+    assert(error_message != nullptr);
+    skdb_free(error_message);
+#endif
 
     assert(skdb_close(db) == SKDB_OK);
 }

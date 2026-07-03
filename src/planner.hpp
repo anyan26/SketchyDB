@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 
 namespace sketchydb {
@@ -11,6 +12,7 @@ enum class ExecutionMode {
 
 struct Plan {
     ExecutionMode mode = ExecutionMode::Exact;
+    std::string approximate_function;
 };
 
 class Planner {

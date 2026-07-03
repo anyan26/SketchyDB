@@ -48,6 +48,14 @@ make clean
 make SKDB_USE_DUCKDB=1
 ```
 
+With the local DuckDB bundle in your home directory:
+
+```bash
+make clean
+make SKDB_USE_DUCKDB=1 DUCKDB_PREFIX=/Users/anyan/libduckdb-osx-universal
+make test SKDB_USE_DUCKDB=1 DUCKDB_PREFIX=/Users/anyan/libduckdb-osx-universal
+```
+
 Current layout:
 
 - `include/sketchydb.h`: public C API, similar in spirit to `sqlite3.h`.
@@ -56,3 +64,12 @@ Current layout:
 - `src/duckdb_backend.cpp`: exact execution adapter for DuckDB.
 - `shell/shell.cpp`: tiny interactive shell.
 - `tests/test_smoke.cpp`: smoke test for opening, executing, errors, and closing.
+
+First SketchyDB-specific SQL shape:
+
+```sql
+SELECT APPROX_COUNT_DISTINCT(user_id) FROM events;
+```
+
+The planner recognizes that as an approximate request and stops before DuckDB.
+The randomized algorithm implementation is intentionally still empty.

@@ -14,6 +14,19 @@ void print_help() {
     std::cout << ".quit or .exit     Exit the shell\n";
 }
 
+int print_row(void* user_data, int column_count, char** column_values, char** column_names) {
+    (void)user_data;
+
+    for (int column = 0; column < column_count; ++column) {
+        if (column > 0) {
+            std::cout << " | ";
+        }
+        std::cout << column_names[column] << "=" << column_values[column];
+    }
+    std::cout << '\n';
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -43,7 +56,7 @@ int main(int argc, char** argv) {
         }
 
         char* error_message = nullptr;
-        rc = skdb_exec(db, line.c_str(), nullptr, nullptr, &error_message);
+        rc = skdb_exec(db, line.c_str(), print_row, nullptr, &error_message);
         if (rc != SKDB_OK) {
             std::cerr << "error: " << (error_message == nullptr ? skdb_errmsg(db) : error_message)
                       << '\n';

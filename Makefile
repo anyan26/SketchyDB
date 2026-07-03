@@ -10,8 +10,14 @@ ifeq ($(SKDB_USE_DUCKDB),1)
 CPPFLAGS += -DSKDB_USE_DUCKDB
 LDLIBS += -lduckdb
 ifneq ($(DUCKDB_PREFIX),)
+CPPFLAGS += -I$(DUCKDB_PREFIX)
+LDFLAGS += -L$(DUCKDB_PREFIX) -Wl,-rpath,$(DUCKDB_PREFIX)
+ifneq ($(wildcard $(DUCKDB_PREFIX)/include),)
 CPPFLAGS += -I$(DUCKDB_PREFIX)/include
-LDFLAGS += -L$(DUCKDB_PREFIX)/lib
+endif
+ifneq ($(wildcard $(DUCKDB_PREFIX)/lib),)
+LDFLAGS += -L$(DUCKDB_PREFIX)/lib -Wl,-rpath,$(DUCKDB_PREFIX)/lib
+endif
 endif
 endif
 
@@ -49,8 +55,15 @@ $(BUILD_DIR)/test_smoke.o: tests/test_smoke.cpp include/sketchydb.h | $(BUILD_DI
 $(BUILD_DIR)/test_smoke: $(BUILD_DIR)/test_smoke.o $(BUILD_DIR)/libsketchydb.a
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-test: $(BUILD_DIR)/test_smoke
+$(BUILD_DIR)/test_planner.o: tests/test_planner.cpp src/planner.hpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) -Isrc $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_planner: $(BUILD_DIR)/test_planner.o $(BUILD_DIR)/planner.o
+	$(CXX) $(CXXFLAGS) $^ -o $@
+
+test: $(BUILD_DIR)/test_smoke $(BUILD_DIR)/test_planner
 	./$(BUILD_DIR)/test_smoke
+	./$(BUILD_DIR)/test_planner
 
 clean:
 	rm -rf $(BUILD_DIR)
