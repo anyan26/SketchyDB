@@ -25,7 +25,7 @@ int main() {
     error_message = nullptr;
     rc = skdb_exec(
         db,
-        "select APPROX_COUNT_DISTINCT(user_id) from events",
+        "select APPROX_COUNT_DISTINCT(user_id, 0.01, 0.99) from events",
         nullptr,
         nullptr,
         &error_message);
@@ -39,7 +39,7 @@ int main() {
     error_message = nullptr;
     rc = skdb_exec(
         db,
-        "select 'approx_count_distinct(user_id)' as literal",
+        "select 'approx_count_distinct(user_id, 0.01, 0.99)' as literal",
         nullptr,
         nullptr,
         &error_message);

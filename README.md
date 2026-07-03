@@ -70,8 +70,10 @@ Current layout:
 First SketchyDB-specific SQL shape:
 
 ```sql
-SELECT APPROX_COUNT_DISTINCT(user_id) FROM events;
+SELECT APPROX_COUNT_DISTINCT(user_id, 0.01, 0.99) FROM events;
 ```
 
-The planner recognizes that as an approximate request and stops before DuckDB.
-The randomized algorithm implementation is intentionally still empty.
+The second argument is `epsilon`, the tolerated error bound, and the third
+argument is `confidence`, the probability target for satisfying that bound. The
+planner recognizes that as an approximate request and stops before DuckDB. The
+randomized algorithm implementation is intentionally still empty.

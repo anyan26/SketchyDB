@@ -13,6 +13,9 @@ enum class ExecutionMode {
 struct Plan {
     ExecutionMode mode = ExecutionMode::Exact;
     std::string approximate_function;
+    double epsilon = 0.0;
+    double confidence = 1.0;
+    std::string error_message;
 };
 
 class Planner {

@@ -92,6 +92,9 @@ int skdb_exec(
 
     auto plan = db->planner.plan(sql);
     if (plan.mode == sketchydb::ExecutionMode::Approximate) {
+        if (!plan.error_message.empty()) {
+            return set_error(db, error_message, plan.error_message);
+        }
         return set_error(
             db,
             error_message,
