@@ -2,6 +2,68 @@
 
 #include <cassert>
 #include <cstring>
+#include <filesystem>
+#include <string>
+
+namespace {
+
+struct SingleValue {
+    std::string value;
+};
+
+int capture_single_value(void* user_data, int column_count, char** column_values, char** column_names) {
+    (void)column_names;
+
+    auto* captured = static_cast<SingleValue*>(user_data);
+    assert(column_count == 1);
+    captured->value = column_values[0] == nullptr ? "" : column_values[0];
+    return 0;
+}
+
+#ifdef SKDB_USE_DUCKDB
+void test_persistent_sketches() {
+    skdb* db = nullptr;
+    char* error_message = nullptr;
+    const char* filename = "build/sketchydb_persist_test.duckdb";
+    const auto sketch_dir = std::filesystem::path(std::string(filename) + ".sketchydb");
+
+    assert(skdb_open(filename, &db) == SKDB_OK);
+    assert(skdb_exec(
+               db,
+               "create or replace table events(user_id varchar);"
+               "insert into events(user_id) values ('a'), ('b'), ('a'), ('c');",
+               nullptr,
+               nullptr,
+               &error_message) == SKDB_OK);
+    assert(error_message == nullptr);
+
+    SingleValue first_estimate;
+    assert(skdb_exec(
+               db,
+               "select APPROX_COUNT_DISTINCT(user_id, 0.01, 0.99) from events",
+               capture_single_value,
+               &first_estimate,
+               &error_message) == SKDB_OK);
+    assert(error_message == nullptr);
+    assert(std::filesystem::exists(sketch_dir));
+    assert(skdb_close(db) == SKDB_OK);
+
+    db = nullptr;
+    assert(skdb_open(filename, &db) == SKDB_OK);
+    SingleValue reopened_estimate;
+    assert(skdb_exec(
+               db,
+               "select APPROX_COUNT_DISTINCT(user_id, 0.01, 0.99) from events",
+               capture_single_value,
+               &reopened_estimate,
+               &error_message) == SKDB_OK);
+    assert(error_message == nullptr);
+    assert(reopened_estimate.value == first_estimate.value);
+    assert(skdb_close(db) == SKDB_OK);
+}
+#endif
+
+}  // namespace
 
 int main() {
     skdb* db = nullptr;
@@ -22,19 +84,57 @@ int main() {
                "DuckDB support is not compiled in; rebuild with SKDB_USE_DUCKDB=1") == 0);
     skdb_free(error_message);
 #endif
+
+#ifdef SKDB_USE_DUCKDB
+    assert(skdb_exec(
+               db,
+               "create table events(user_id varchar);"
+               "insert into events(user_id) values ('a'), ('b'), ('a'), ('c');",
+               nullptr,
+               nullptr,
+               &error_message) == SKDB_OK);
+    assert(error_message == nullptr);
+#endif
+
     error_message = nullptr;
+    SingleValue approximate_count;
     rc = skdb_exec(
         db,
         "select APPROX_COUNT_DISTINCT(user_id, 0.01, 0.99) from events",
-        nullptr,
-        nullptr,
+        capture_single_value,
+        &approximate_count,
         &error_message);
+#ifdef SKDB_USE_DUCKDB
+    assert(rc == SKDB_OK);
+    assert(error_message == nullptr);
+    assert(!approximate_count.value.empty());
+
+    assert(skdb_exec(
+               db,
+               "insert into events(user_id) values ('d');",
+               nullptr,
+               nullptr,
+               &error_message) == SKDB_OK);
+    assert(error_message == nullptr);
+
+    SingleValue approximate_count_after_insert;
+    assert(skdb_exec(
+               db,
+               "select APPROX_COUNT_DISTINCT(user_id, 0.01, 0.99) from events",
+               capture_single_value,
+               &approximate_count_after_insert,
+               &error_message) == SKDB_OK);
+    assert(error_message == nullptr);
+    assert(!approximate_count_after_insert.value.empty());
+    assert(approximate_count_after_insert.value != approximate_count.value);
+#else
     assert(rc == SKDB_ERROR);
     assert(error_message != nullptr);
     assert(std::strcmp(
                error_message,
-               "approx_count_distinct is recognized but not implemented yet") == 0);
+               "DuckDB support is not compiled in; rebuild with SKDB_USE_DUCKDB=1") == 0);
     skdb_free(error_message);
+#endif
 
     error_message = nullptr;
     rc = skdb_exec(
@@ -53,4 +153,8 @@ int main() {
 #endif
 
     assert(skdb_close(db) == SKDB_OK);
+
+#ifdef SKDB_USE_DUCKDB
+    test_persistent_sketches();
+#endif
 }

@@ -22,9 +22,9 @@ endif
 endif
 
 BUILD_DIR := build
-LIB_OBJECTS := $(BUILD_DIR)/sketchydb.o $(BUILD_DIR)/planner.o $(BUILD_DIR)/duckdb_backend.o
+LIB_OBJECTS := $(BUILD_DIR)/sketchydb.o $(BUILD_DIR)/planner.o $(BUILD_DIR)/duckdb_backend.o $(BUILD_DIR)/hyperloglog.o
 
-.PHONY: all clean test
+.PHONY: all clean test perf
 
 all: $(BUILD_DIR)/libsketchydb.a $(BUILD_DIR)/sketchydb
 
@@ -38,6 +38,9 @@ $(BUILD_DIR)/planner.o: src/planner.cpp src/planner.hpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/duckdb_backend.o: src/duckdb_backend.cpp src/duckdb_backend.hpp include/sketchydb.h | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/hyperloglog.o: src/hyperloglog.cpp src/hyperloglog.hpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/libsketchydb.a: $(LIB_OBJECTS)
@@ -61,9 +64,25 @@ $(BUILD_DIR)/test_planner.o: tests/test_planner.cpp src/planner.hpp | $(BUILD_DI
 $(BUILD_DIR)/test_planner: $(BUILD_DIR)/test_planner.o $(BUILD_DIR)/planner.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-test: $(BUILD_DIR)/test_smoke $(BUILD_DIR)/test_planner
+$(BUILD_DIR)/test_hyperloglog.o: tests/test_hyperloglog.cpp src/hyperloglog.hpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) -Isrc $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_hyperloglog: $(BUILD_DIR)/test_hyperloglog.o $(BUILD_DIR)/hyperloglog.o
+	$(CXX) $(CXXFLAGS) $^ -o $@
+
+test: $(BUILD_DIR)/test_smoke $(BUILD_DIR)/test_planner $(BUILD_DIR)/test_hyperloglog
 	./$(BUILD_DIR)/test_smoke
 	./$(BUILD_DIR)/test_planner
+	./$(BUILD_DIR)/test_hyperloglog
+
+$(BUILD_DIR)/bench_count_distinct.o: tests/bench_count_distinct.cpp include/sketchydb.h | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/bench_count_distinct: $(BUILD_DIR)/bench_count_distinct.o $(BUILD_DIR)/libsketchydb.a
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+perf: $(BUILD_DIR)/bench_count_distinct
+	./$(BUILD_DIR)/bench_count_distinct
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -50,6 +50,9 @@ void captures_epsilon_and_confidence() {
 
     assert(plan.mode == sketchydb::ExecutionMode::Approximate);
     assert(plan.approximate_function == "approx_count_distinct");
+    assert(plan.input_sql == "select user_id as skdb_hll_value from events");
+    assert(plan.source_table == "events");
+    assert(plan.source_column == "user_id");
     assert(plan.epsilon == 0.05);
     assert(plan.confidence == 0.95);
 }
@@ -98,6 +101,68 @@ void exact_query_stays_exact() {
     assert_exact("select 1");
 }
 
+void mutation_queries_invalidate_sketches() {
+    sketchydb::Planner planner;
+
+    auto insert_plan = planner.plan("insert into events values ('a')");
+    assert(insert_plan.mode == sketchydb::ExecutionMode::Exact);
+    assert(insert_plan.invalidates_sketches);
+    assert(insert_plan.mutation_kind == sketchydb::MutationKind::InsertValues);
+    assert(insert_plan.mutation_table == "events");
+    assert(insert_plan.insert_rows.size() == 1);
+    assert(insert_plan.insert_rows[0].size() == 1);
+    assert(insert_plan.insert_rows[0][0] == "a");
+
+    auto update_plan = planner.plan("update events set user_id = 'b'");
+    assert(update_plan.mode == sketchydb::ExecutionMode::Exact);
+    assert(update_plan.invalidates_sketches);
+    assert(update_plan.mutation_kind == sketchydb::MutationKind::Other);
+
+    auto alter_plan = planner.plan("alter table events add column city varchar");
+    assert(alter_plan.mode == sketchydb::ExecutionMode::Exact);
+    assert(alter_plan.invalidates_sketches);
+}
+
+void insert_column_list_is_parsed() {
+    sketchydb::Planner planner;
+
+    auto plan = planner.plan("insert into events(city, user_id) values ('nyc', 'user-1'), ('sf', 'user-2')");
+    assert(plan.mode == sketchydb::ExecutionMode::Exact);
+    assert(plan.invalidates_sketches);
+    assert(plan.mutation_kind == sketchydb::MutationKind::InsertValues);
+    assert(plan.mutation_table == "events");
+    assert(plan.insert_columns.size() == 2);
+    assert(plan.insert_columns[0] == "city");
+    assert(plan.insert_columns[1] == "user_id");
+    assert(plan.insert_rows.size() == 2);
+    assert(plan.insert_rows[0][1] == "user-1");
+    assert(plan.insert_rows[1][1] == "user-2");
+}
+
+void mutation_keywords_inside_strings_and_comments_do_not_invalidate() {
+    sketchydb::Planner planner;
+
+    auto string_plan = planner.plan("select 'insert into events values (1)' as text");
+    assert(string_plan.mode == sketchydb::ExecutionMode::Exact);
+    assert(!string_plan.invalidates_sketches);
+
+    auto comment_plan = planner.plan("-- update events\nselect 1");
+    assert(comment_plan.mode == sketchydb::ExecutionMode::Exact);
+    assert(!comment_plan.invalidates_sketches);
+
+    auto column_plan = planner.plan("select create, update from events");
+    assert(column_plan.mode == sketchydb::ExecutionMode::Exact);
+    assert(!column_plan.invalidates_sketches);
+}
+
+void later_statement_mutations_invalidate_sketches() {
+    sketchydb::Planner planner;
+
+    auto plan = planner.plan("select 1; insert into events values ('a')");
+    assert(plan.mode == sketchydb::ExecutionMode::Exact);
+    assert(plan.invalidates_sketches);
+}
+
 void identifier_without_call_stays_exact() {
     assert_exact("select approx_count_distinct from metrics");
     assert_exact("select approx_count_distinct_value from metrics");
@@ -134,6 +199,10 @@ int main() {
     rejects_out_of_range_confidence();
     rejects_non_numeric_bounds();
     exact_query_stays_exact();
+    mutation_queries_invalidate_sketches();
+    insert_column_list_is_parsed();
+    mutation_keywords_inside_strings_and_comments_do_not_invalidate();
+    later_statement_mutations_invalidate_sketches();
     identifier_without_call_stays_exact();
     string_literals_do_not_trigger_approximate_mode();
     comments_do_not_trigger_approximate_mode();
