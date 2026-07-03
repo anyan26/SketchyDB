@@ -16,14 +16,22 @@ What if we are okay with being 99% correct...and much much faster?
 
 Instead of computing everything exactly, SketchyDB uses probabilistic data structures and randomized algorithms to provide answers with explicit confidence guarantees.
 
+As of right now, SketchyDB only support basic operations.
+This is based on the belief that most DB operations are simple and repetitive. And speed-ups on those are both fun and useful.
+
 ## Pending Features
+### Approx_quantile, median, p96
+KLL sketch
+
 ### Heavy Hitters 
 Find the most frequent items in massive dataset without counting everything.
+Count-Min Sketch + heap
 
-### Approximate Cardinality
-Count billions of unique values using only kilobytes of memory.
+### APPROX_FREQ(x)
+Count-MIn sketch
 
-### Sketch-Accelerated Queries
+### Approx_Join_Size 
+bottom-k / MinHash sketch
 
 ### Confidence-Driven Query Planning
 User specify the theoretical lower-bound they are willing to accept.
@@ -103,16 +111,25 @@ Run:
 make perf SKDB_USE_DUCKDB=1 DUCKDB_PREFIX=/Users/anyan/libduckdb-osx-universal
 ```
 
-Latest local result for 1,000,000 inserted rows with 100,000 distinct users:
+Latest local result, using 5 trials of 500,000 streamed inserts with 100,000
+distinct users:
 
 ```text
-rows=1000000 distinct=100000
-sketchydb_insert_stream_time_ms=2723.09
-duckdb_count_distinct=100000 time_ms=9.34604
-sketchydb_hll_first_after_stream_insert=101779.144321 time_ms=0.071042
-sketchydb_hll_cached=101779.144321 time_ms=0.059875
+trials=5 rows=500000 distinct=100000
+duckdb_insert_stream_mean_ms=1340.37 median_ms=1340.13
+sketchydb_insert_stream_with_hll_mean_ms=1407.3 median_ms=1392.04
+duckdb_count_distinct_mean_ms=4.21287 median_ms=3.47904
+sketchydb_hll_first_after_stream_insert_mean_ms=0.0398084 median_ms=0.038333
+sketchydb_hll_cached_mean_ms=0.0322916 median_ms=0.0315
+insert_overhead_mean_ms=66.9287
+hll_read_speedup_vs_duckdb_mean_x=105.829
+cached_hll_read_speedup_vs_duckdb_mean_x=130.463
+break_even_approx_queries_after_ingest=16.0382
+exact_count=100000 approx_count=101779 relative_error=0.0177914
 ```
 
-The insert path pays the streaming sketch maintenance cost. After that,
-`APPROX_COUNT_DISTINCT(user_id, 0.05, 0.90)` is already cache-backed, so the
-first approximate read avoids the old full-table HLL build.
+The insert path paid about 67 ms of extra sketch-maintenance cost over raw
+DuckDB insertion in this run. After that, `APPROX_COUNT_DISTINCT(user_id, 0.05,
+0.90)` was already cache-backed and read about 106x faster than DuckDB's exact
+`COUNT(DISTINCT)`. In this workload, the streaming sketch pays for itself after
+about 16 approximate reads over the ingested data.
