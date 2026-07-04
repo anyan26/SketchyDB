@@ -27,7 +27,10 @@ endif
 endif
 endif
 
-BUILD_DIR := build
+BUILD_DIR := build/plain
+ifeq ($(SKDB_USE_DUCKDB),1)
+BUILD_DIR := build/duckdb
+endif
 LIB_OBJECTS := $(BUILD_DIR)/sketchydb.o $(BUILD_DIR)/planner.o $(BUILD_DIR)/duckdb_backend.o $(BUILD_DIR)/hyperloglog.o
 
 .PHONY: all clean test perf
@@ -91,4 +94,4 @@ perf: $(BUILD_DIR)/bench_count_distinct
 	SKDB_HASH_SEED="$(SKDB_HASH_SEED)" ./$(BUILD_DIR)/bench_count_distinct $(PERF_TRIALS) $(PERF_ROWS) $(PERF_DISTINCT) $(PERF_BATCH_SIZE) $(PERF_SEED)
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf build
