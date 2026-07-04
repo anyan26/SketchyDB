@@ -5,6 +5,12 @@ LDFLAGS ?=
 LDLIBS ?=
 SKDB_USE_DUCKDB ?= 0
 DUCKDB_PREFIX ?=
+PERF_TRIALS ?= 5
+PERF_ROWS ?= 500000
+PERF_DISTINCT ?= 100000
+PERF_BATCH_SIZE ?= 1000
+PERF_SEED ?= 1337
+SKDB_HASH_SEED ?=
 
 ifeq ($(SKDB_USE_DUCKDB),1)
 CPPFLAGS += -DSKDB_USE_DUCKDB
@@ -82,7 +88,7 @@ $(BUILD_DIR)/bench_count_distinct: $(BUILD_DIR)/bench_count_distinct.o $(BUILD_D
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 perf: $(BUILD_DIR)/bench_count_distinct
-	./$(BUILD_DIR)/bench_count_distinct
+	SKDB_HASH_SEED="$(SKDB_HASH_SEED)" ./$(BUILD_DIR)/bench_count_distinct $(PERF_TRIALS) $(PERF_ROWS) $(PERF_DISTINCT) $(PERF_BATCH_SIZE) $(PERF_SEED)
 
 clean:
 	rm -rf $(BUILD_DIR)

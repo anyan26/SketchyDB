@@ -4,12 +4,14 @@
 #include "hyperloglog.hpp"
 #include "planner.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <new>
+#include <random>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -21,9 +23,10 @@ namespace {
 
 constexpr const char* kVersion = "0.1.0";
 constexpr std::uint64_t kPartitionTargetRows = 65536;
-constexpr char kSketchMagic[] = "SKDBHLL1";
+constexpr char kSketchMagic[] = "SKDBHLL2";
 constexpr double kDefaultStreamingEpsilon = 0.05;
 constexpr double kDefaultStreamingConfidence = 0.90;
+constexpr std::uint8_t kMaxHllPrecision = 24;
 
 struct HllCacheEntry;
 
@@ -34,17 +37,27 @@ struct HllCallbackState {
 struct HllCacheEntry {
     double epsilon = 0.0;
     double confidence = 1.0;
+    std::uint8_t precision = 0;
+    std::uint64_t hash_seed = 0;
     std::string source_table;
     std::string source_column;
     std::vector<sketchydb::HyperLogLog> partitions;
     std::uint64_t active_partition_rows = 0;
 
-    HllCacheEntry(double epsilon, double confidence, std::string table, std::string column)
+    HllCacheEntry(
+        double epsilon,
+        double confidence,
+        std::uint8_t precision,
+        std::uint64_t hash_seed,
+        std::string table,
+        std::string column)
         : epsilon(epsilon),
           confidence(confidence),
+          precision(precision),
+          hash_seed(hash_seed),
           source_table(std::move(table)),
           source_column(std::move(column)) {
-        partitions.emplace_back(epsilon, confidence);
+        partitions.emplace_back(precision, hash_seed);
     }
 };
 
@@ -56,6 +69,7 @@ struct skdb {
     sketchydb::Planner planner;
     std::unique_ptr<sketchydb::DuckDBBackend> exact_backend;
     std::unordered_map<std::string, HllCacheEntry> hll_cache;
+    std::uint64_t hash_seed = 0;
 };
 
 namespace {
@@ -94,7 +108,9 @@ int collect_hll_value(void* user_data, int column_count, char** column_values, c
     }
     if (column_values[0] != nullptr) {
         if (state->entry->active_partition_rows >= kPartitionTargetRows) {
-            state->entry->partitions.emplace_back(state->entry->epsilon, state->entry->confidence);
+            state->entry->partitions.emplace_back(
+                state->entry->precision,
+                state->entry->hash_seed);
             state->entry->active_partition_rows = 0;
         }
         state->entry->partitions.back().add(column_values[0]);
@@ -113,9 +129,26 @@ int emit_single_value(skdb_callback callback, void* user_data, std::string value
     return callback(user_data, 1, values, names) == 0 ? SKDB_OK : SKDB_ERROR;
 }
 
-std::string hll_cache_key(const sketchydb::Plan& plan) {
-    return plan.approximate_function + "|" + plan.input_sql + "|" +
-           std::to_string(plan.epsilon) + "|" + std::to_string(plan.confidence);
+std::uint64_t parse_hash_seed_override() {
+    const char* value = std::getenv("SKDB_HASH_SEED");
+    if (value == nullptr || *value == '\0') {
+        return 0;
+    }
+
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    return end != value && *end == '\0' ? static_cast<std::uint64_t>(parsed) : 0;
+}
+
+std::uint64_t generate_hash_seed() {
+    if (const auto override_seed = parse_hash_seed_override(); override_seed != 0) {
+        return override_seed;
+    }
+
+    std::random_device random_device;
+    const auto high = static_cast<std::uint64_t>(random_device()) << 32U;
+    const auto low = static_cast<std::uint64_t>(random_device());
+    return high ^ low;
 }
 
 std::string hll_input_sql(std::string_view table, std::string_view column) {
@@ -125,10 +158,13 @@ std::string hll_input_sql(std::string_view table, std::string_view column) {
 std::string hll_cache_key(
     std::string_view function_name,
     std::string_view input_sql,
-    double epsilon,
-    double confidence) {
+    std::uint8_t precision) {
     return std::string(function_name) + "|" + std::string(input_sql) + "|" +
-           std::to_string(epsilon) + "|" + std::to_string(confidence);
+           std::to_string(static_cast<unsigned int>(precision));
+}
+
+std::string hll_cache_key(const sketchydb::Plan& plan, std::uint8_t precision) {
+    return hll_cache_key(plan.approximate_function, plan.input_sql, precision);
 }
 
 std::uint64_t stable_hash(std::string_view value) {
@@ -154,8 +190,47 @@ std::filesystem::path sketch_root(const skdb* db) {
     return std::filesystem::path(db->filename).string() + ".sketchydb";
 }
 
+std::filesystem::path hash_seed_path(const skdb* db) {
+    return sketch_root(db) / "hash_seed";
+}
+
 std::filesystem::path sketch_path(const skdb* db, const std::string& cache_key) {
     return sketch_root(db) / (hex_hash(cache_key) + ".hll");
+}
+
+void save_hash_seed(const skdb* db) {
+    if (!persistence_enabled(db) || db->hash_seed == 0) {
+        return;
+    }
+
+    std::filesystem::create_directories(sketch_root(db));
+    std::ofstream output(hash_seed_path(db), std::ios::trunc);
+    if (output) {
+        output << db->hash_seed << '\n';
+    }
+}
+
+std::uint64_t load_hash_seed(const skdb* db) {
+    if (!persistence_enabled(db)) {
+        return 0;
+    }
+
+    std::ifstream input(hash_seed_path(db));
+    std::uint64_t seed = 0;
+    input >> seed;
+    return input ? seed : 0;
+}
+
+std::uint64_t load_or_create_hash_seed(skdb* db) {
+    if (const auto override_seed = parse_hash_seed_override(); override_seed != 0) {
+        return override_seed;
+    }
+
+    if (const auto persisted_seed = load_hash_seed(db); persisted_seed != 0) {
+        return persisted_seed;
+    }
+
+    return generate_hash_seed();
 }
 
 double estimate_partitioned_hll(const HllCacheEntry& entry) {
@@ -184,18 +259,18 @@ void save_hll_entry(const skdb* db, const std::string& cache_key, const HllCache
     const std::uint64_t partition_count = entry.partitions.size();
     const std::uint64_t source_table_size = entry.source_table.size();
     const std::uint64_t source_column_size = entry.source_column.size();
-    const auto precision = entry.partitions.front().precision();
     const std::uint64_t register_count = entry.partitions.front().register_count();
 
     output.write(kSketchMagic, sizeof(kSketchMagic));
     output.write(reinterpret_cast<const char*>(&entry.epsilon), sizeof(entry.epsilon));
     output.write(reinterpret_cast<const char*>(&entry.confidence), sizeof(entry.confidence));
+    output.write(reinterpret_cast<const char*>(&entry.precision), sizeof(entry.precision));
+    output.write(reinterpret_cast<const char*>(&entry.hash_seed), sizeof(entry.hash_seed));
     output.write(reinterpret_cast<const char*>(&entry.active_partition_rows), sizeof(entry.active_partition_rows));
     output.write(reinterpret_cast<const char*>(&source_table_size), sizeof(source_table_size));
     output.write(entry.source_table.data(), static_cast<std::streamsize>(entry.source_table.size()));
     output.write(reinterpret_cast<const char*>(&source_column_size), sizeof(source_column_size));
     output.write(entry.source_column.data(), static_cast<std::streamsize>(entry.source_column.size()));
-    output.write(reinterpret_cast<const char*>(&precision), sizeof(precision));
     output.write(reinterpret_cast<const char*>(&register_count), sizeof(register_count));
     output.write(reinterpret_cast<const char*>(&partition_count), sizeof(partition_count));
 
@@ -233,17 +308,17 @@ bool load_hll_entry(const skdb* db, const std::string& cache_key, HllCacheEntry&
         return false;
     }
 
-    std::uint8_t precision = 0;
     std::uint64_t register_count = 0;
     std::uint64_t partition_count = 0;
 
     input.read(reinterpret_cast<char*>(&entry.epsilon), sizeof(entry.epsilon));
     input.read(reinterpret_cast<char*>(&entry.confidence), sizeof(entry.confidence));
+    input.read(reinterpret_cast<char*>(&entry.precision), sizeof(entry.precision));
+    input.read(reinterpret_cast<char*>(&entry.hash_seed), sizeof(entry.hash_seed));
     input.read(reinterpret_cast<char*>(&entry.active_partition_rows), sizeof(entry.active_partition_rows));
     if (!read_string(input, entry.source_table) || !read_string(input, entry.source_column)) {
         return false;
     }
-    input.read(reinterpret_cast<char*>(&precision), sizeof(precision));
     input.read(reinterpret_cast<char*>(&register_count), sizeof(register_count));
     input.read(reinterpret_cast<char*>(&partition_count), sizeof(partition_count));
     if (!input || partition_count == 0 || partition_count > 100000 || register_count == 0) {
@@ -259,15 +334,18 @@ bool load_hll_entry(const skdb* db, const std::string& cache_key, HllCacheEntry&
         if (!input) {
             return false;
         }
-        entry.partitions.emplace_back(precision, std::move(registers));
+        entry.partitions.emplace_back(entry.precision, entry.hash_seed, std::move(registers));
     }
 
     return true;
 }
 
-void invalidate_persisted_sketches(const skdb* db) {
+void invalidate_persisted_sketches(skdb* db) {
     if (persistence_enabled(db)) {
+        const auto seed = db->hash_seed;
         std::filesystem::remove_all(sketch_root(db));
+        db->hash_seed = seed;
+        save_hash_seed(db);
     }
 }
 
@@ -310,7 +388,7 @@ bool add_inserted_values_to_hll_cache(skdb* db, const sketchydb::Plan& plan) {
                 return false;
             }
             if (entry.active_partition_rows >= kPartitionTargetRows) {
-                entry.partitions.emplace_back(entry.epsilon, entry.confidence);
+                entry.partitions.emplace_back(entry.precision, entry.hash_seed);
                 entry.active_partition_rows = 0;
             }
             entry.partitions.back().add(row[column_index]);
@@ -335,11 +413,13 @@ bool prewarm_streaming_hll_cache(skdb* db, const sketchydb::Plan& plan) {
         }
 
         const auto input_sql = hll_input_sql(plan.mutation_table, column);
+        const auto default_precision = sketchydb::HyperLogLog::required_precision(
+            kDefaultStreamingEpsilon,
+            kDefaultStreamingConfidence);
         const auto cache_key = hll_cache_key(
             "approx_count_distinct",
             input_sql,
-            kDefaultStreamingEpsilon,
-            kDefaultStreamingConfidence);
+            default_precision);
 
         auto cached = db->hll_cache.find(cache_key);
         if (cached != db->hll_cache.end()) {
@@ -352,6 +432,8 @@ bool prewarm_streaming_hll_cache(skdb* db, const sketchydb::Plan& plan) {
             std::forward_as_tuple(
                 kDefaultStreamingEpsilon,
                 kDefaultStreamingConfidence,
+                default_precision,
+                db->hash_seed,
                 plan.mutation_table,
                 column));
         cached = inserted.first;
@@ -362,8 +444,8 @@ bool prewarm_streaming_hll_cache(skdb* db, const sketchydb::Plan& plan) {
             }
             if (cached->second.active_partition_rows >= kPartitionTargetRows) {
                 cached->second.partitions.emplace_back(
-                    cached->second.epsilon,
-                    cached->second.confidence);
+                    cached->second.precision,
+                    cached->second.hash_seed);
                 cached->second.active_partition_rows = 0;
             }
             cached->second.partitions.back().add(row[column_index]);
@@ -375,6 +457,54 @@ bool prewarm_streaming_hll_cache(skdb* db, const sketchydb::Plan& plan) {
     }
 
     return prewarmed_any;
+}
+
+std::string hll_cache_key_for_precision(const sketchydb::Plan& plan, std::uint8_t precision) {
+    return hll_cache_key(plan, precision);
+}
+
+std::pair<std::string, HllCacheEntry*> find_sufficient_hll_cache(
+    skdb* db,
+    const sketchydb::Plan& plan,
+    std::uint8_t required_precision) {
+    for (std::uint8_t precision = required_precision; precision <= kMaxHllPrecision; ++precision) {
+        auto key = hll_cache_key_for_precision(plan, precision);
+        auto found = db->hll_cache.find(key);
+        if (found != db->hll_cache.end() && found->second.hash_seed == db->hash_seed) {
+            return {std::move(key), &found->second};
+        }
+    }
+
+    return {"", nullptr};
+}
+
+std::pair<std::string, HllCacheEntry*> load_sufficient_hll_cache(
+    skdb* db,
+    const sketchydb::Plan& plan,
+    std::uint8_t required_precision) {
+    for (std::uint8_t precision = required_precision; precision <= kMaxHllPrecision; ++precision) {
+        auto key = hll_cache_key_for_precision(plan, precision);
+        auto inserted = db->hll_cache.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(key),
+            std::forward_as_tuple(
+                plan.epsilon,
+                plan.confidence,
+                precision,
+                db->hash_seed,
+                plan.source_table,
+                plan.source_column));
+
+        if (load_hll_entry(db, key, inserted.first->second) &&
+            inserted.first->second.hash_seed == db->hash_seed &&
+            inserted.first->second.precision >= required_precision) {
+            return {std::move(key), &inserted.first->second};
+        }
+
+        db->hll_cache.erase(inserted.first);
+    }
+
+    return {"", nullptr};
 }
 
 }  // namespace
@@ -392,6 +522,8 @@ int skdb_open(const char* filename, skdb** out_db) {
     }
 
     db->filename = filename == nullptr ? ":memory:" : filename;
+    db->hash_seed = load_or_create_hash_seed(db);
+    save_hash_seed(db);
     try {
         db->exact_backend = std::make_unique<sketchydb::DuckDBBackend>(db->filename);
     } catch (const std::exception& exception) {
@@ -434,39 +566,46 @@ int skdb_exec(
                 plan.approximate_function + " is recognized but not implemented yet");
         }
 
-        const auto cache_key = hll_cache_key(plan);
-        auto cached = db->hll_cache.find(cache_key);
-        if (cached == db->hll_cache.end()) {
+        const auto required_precision =
+            sketchydb::HyperLogLog::required_precision(plan.epsilon, plan.confidence);
+        auto [cache_key, cached] = find_sufficient_hll_cache(db, plan, required_precision);
+        if (cached == nullptr) {
+            auto loaded = load_sufficient_hll_cache(db, plan, required_precision);
+            cache_key = std::move(loaded.first);
+            cached = loaded.second;
+        }
+        if (cached == nullptr) {
+            cache_key = hll_cache_key_for_precision(plan, required_precision);
             auto inserted = db->hll_cache.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(cache_key),
                 std::forward_as_tuple(
                     plan.epsilon,
                     plan.confidence,
+                    required_precision,
+                    db->hash_seed,
                     plan.source_table,
                     plan.source_column));
-            cached = inserted.first;
+            cached = &inserted.first->second;
 
-            if (!load_hll_entry(db, cache_key, cached->second)) {
-                HllCallbackState state{.entry = &cached->second};
-                std::string error;
-                int rc = db->exact_backend->exec(
-                    plan.input_sql.c_str(),
-                    collect_hll_value,
-                    &state,
-                    error);
-                if (rc != SKDB_OK) {
-                    db->hll_cache.erase(cached);
-                    return set_error(db, error_message, error);
-                }
-                save_hll_entry(db, cache_key, cached->second);
+            HllCallbackState state{.entry = cached};
+            std::string error;
+            int rc = db->exact_backend->exec(
+                plan.input_sql.c_str(),
+                collect_hll_value,
+                &state,
+                error);
+            if (rc != SKDB_OK) {
+                db->hll_cache.erase(cache_key);
+                return set_error(db, error_message, error);
             }
+            save_hll_entry(db, cache_key, *cached);
         }
 
         int rc = emit_single_value(
             callback,
             user_data,
-            std::to_string(estimate_partitioned_hll(cached->second)),
+            std::to_string(estimate_partitioned_hll(*cached)),
             "approx_count_distinct");
         if (rc != SKDB_OK) {
             return set_error(db, error_message, "query aborted by callback");

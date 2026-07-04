@@ -7,6 +7,8 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -16,12 +18,16 @@
 
 namespace {
 
-constexpr int kTrials = 5;
-constexpr int kRows = 500000;
-constexpr int kDistinct = 100000;
-constexpr int kBatchSize = 1000;
 constexpr const char* kExactSql = "select count(distinct user_id) as exact_count from bench_events";
 constexpr const char* kApproxSql = "select approx_count_distinct(user_id, 0.05, 0.90) from bench_events";
+
+struct Options {
+    int trials = 5;
+    int rows = 500000;
+    int distinct_values = 100000;
+    int batch_size = 1000;
+    std::uint32_t seed = 1337;
+};
 
 struct SingleValue {
     std::string value;
@@ -54,16 +60,29 @@ double time_ms(Function function) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-std::string insert_sql_for_batch(int batch_start) {
+std::string insert_sql_for_batch(const std::vector<int>& values, int batch_start, int batch_size) {
     std::string sql = "insert into bench_events(user_id) values ";
-    for (int offset = 0; offset < kBatchSize; ++offset) {
-        if (offset > 0) {
+    const int batch_end = std::min<int>(static_cast<int>(values.size()), batch_start + batch_size);
+    for (int index = batch_start; index < batch_end; ++index) {
+        if (index > batch_start) {
             sql += ", ";
         }
-        const int value = (batch_start + offset) % kDistinct;
+        const int value = values[static_cast<std::size_t>(index)];
         sql += "('user-" + std::to_string(value) + "')";
     }
     return sql;
+}
+
+std::vector<int> generate_values(const Options& options, int trial) {
+    std::mt19937 generator(options.seed + static_cast<std::uint32_t>(trial));
+    std::uniform_int_distribution<int> distribution(0, options.distinct_values - 1);
+
+    std::vector<int> values;
+    values.reserve(static_cast<std::size_t>(options.rows));
+    for (int index = 0; index < options.rows; ++index) {
+        values.push_back(distribution(generator));
+    }
+    return values;
 }
 
 void exec_or_die(skdb* db, const char* sql) {
@@ -107,7 +126,7 @@ void duckdb_query_or_die(duckdb_connection connection, const std::string& sql) {
     duckdb_query_or_die(connection, sql.c_str());
 }
 
-double run_duckdb_insert_baseline() {
+double run_duckdb_insert_baseline(const Options& options, const std::vector<int>& values) {
     duckdb_database database = nullptr;
     duckdb_connection connection = nullptr;
     if (duckdb_open(nullptr, &database) == DuckDBError) {
@@ -120,8 +139,8 @@ double run_duckdb_insert_baseline() {
 
     duckdb_query_or_die(connection, "create table bench_events(user_id varchar)");
     const double insert_ms = time_ms([&] {
-        for (int batch_start = 0; batch_start < kRows; batch_start += kBatchSize) {
-            duckdb_query_or_die(connection, insert_sql_for_batch(batch_start));
+        for (int batch_start = 0; batch_start < options.rows; batch_start += options.batch_size) {
+            duckdb_query_or_die(connection, insert_sql_for_batch(values, batch_start, options.batch_size));
         }
     });
 
@@ -131,18 +150,19 @@ double run_duckdb_insert_baseline() {
 }
 #endif
 
-TrialResult run_trial() {
+TrialResult run_trial(const Options& options, int trial) {
     TrialResult result;
 #ifdef SKDB_USE_DUCKDB
-    result.duckdb_insert_ms = run_duckdb_insert_baseline();
+    const auto values = generate_values(options, trial);
+    result.duckdb_insert_ms = run_duckdb_insert_baseline(options, values);
 
     skdb* db = nullptr;
     assert(skdb_open(":memory:", &db) == SKDB_OK);
     exec_or_die(db, "create table bench_events(user_id varchar)");
 
     result.sketchydb_insert_stream_ms = time_ms([&] {
-        for (int batch_start = 0; batch_start < kRows; batch_start += kBatchSize) {
-            exec_or_die(db, insert_sql_for_batch(batch_start));
+        for (int batch_start = 0; batch_start < options.rows; batch_start += options.batch_size) {
+            exec_or_die(db, insert_sql_for_batch(values, batch_start, options.batch_size));
         }
     });
 
@@ -197,17 +217,41 @@ void print_metric(const char* name, const std::vector<double>& values) {
               << " median_ms=" << median(values) << '\n';
 }
 
+Options parse_options(int argc, char** argv) {
+    Options options;
+    if (argc > 1) {
+        options.trials = std::stoi(argv[1]);
+    }
+    if (argc > 2) {
+        options.rows = std::stoi(argv[2]);
+    }
+    if (argc > 3) {
+        options.distinct_values = std::stoi(argv[3]);
+    }
+    if (argc > 4) {
+        options.batch_size = std::stoi(argv[4]);
+    }
+    if (argc > 5) {
+        options.seed = static_cast<std::uint32_t>(std::stoul(argv[5]));
+    }
+    if (options.trials < 1 || options.rows < 1 || options.distinct_values < 1 || options.batch_size < 1) {
+        throw std::invalid_argument("usage: bench_count_distinct [trials rows distinct batch_size seed]");
+    }
+    return options;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
 #ifndef SKDB_USE_DUCKDB
     std::cout << "Skipping perf benchmark; rebuild with SKDB_USE_DUCKDB=1.\n";
     return 0;
 #else
+    const auto options = parse_options(argc, argv);
     std::vector<TrialResult> results;
-    results.reserve(kTrials);
-    for (int trial = 0; trial < kTrials; ++trial) {
-        results.push_back(run_trial());
+    results.reserve(static_cast<std::size_t>(options.trials));
+    for (int trial = 0; trial < options.trials; ++trial) {
+        results.push_back(run_trial(options, trial));
     }
 
     const auto duckdb_insert = collect(results, &TrialResult::duckdb_insert_ms);
@@ -223,7 +267,11 @@ int main() {
     const double relative_error =
         std::abs(results.front().approximate_count - results.front().exact_count) / results.front().exact_count;
 
-    std::cout << "trials=" << kTrials << " rows=" << kRows << " distinct=" << kDistinct << '\n';
+    std::cout << "trials=" << options.trials
+              << " rows=" << options.rows
+              << " distinct_domain=" << options.distinct_values
+              << " batch_size=" << options.batch_size
+              << " seed=" << options.seed << '\n';
     print_metric("duckdb_insert_stream", duckdb_insert);
     print_metric("sketchydb_insert_stream_with_hll", sketchy_insert);
     print_metric("duckdb_count_distinct", exact_query);

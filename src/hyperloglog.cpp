@@ -13,8 +13,15 @@ namespace {
 constexpr std::uint8_t kMinPrecision = 4;
 constexpr std::uint8_t kMaxPrecision = 24;
 
-std::uint64_t fnv1a64(std::string_view value) {
-    std::uint64_t hash = 14695981039346656037ULL;
+std::uint64_t splitmix64(std::uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
+std::uint64_t fnv1a64(std::string_view value, std::uint64_t hash_seed) {
+    std::uint64_t hash = 14695981039346656037ULL ^ splitmix64(hash_seed);
     for (unsigned char byte : value) {
         hash ^= byte;
         hash *= 1099511628211ULL;
@@ -74,12 +81,28 @@ std::uint8_t rho(std::uint64_t value, std::uint8_t max_width) {
 
 }  // namespace
 
-HyperLogLog::HyperLogLog(double epsilon, double confidence)
-    : precision_(choose_precision(epsilon, confidence)),
-      registers_(static_cast<std::size_t>(1ULL << precision_), 0) {}
+std::uint8_t HyperLogLog::required_precision(double epsilon, double confidence) {
+    return choose_precision(epsilon, confidence);
+}
 
-HyperLogLog::HyperLogLog(std::uint8_t precision, std::vector<std::uint8_t> registers)
+HyperLogLog::HyperLogLog(double epsilon, double confidence, std::uint64_t hash_seed)
+    : HyperLogLog(choose_precision(epsilon, confidence), hash_seed) {}
+
+HyperLogLog::HyperLogLog(std::uint8_t precision, std::uint64_t hash_seed)
     : precision_(precision),
+      hash_seed_(hash_seed),
+      registers_(static_cast<std::size_t>(1ULL << precision_), 0) {
+    if (precision_ < kMinPrecision || precision_ > kMaxPrecision) {
+        throw std::invalid_argument("invalid HyperLogLog precision");
+    }
+}
+
+HyperLogLog::HyperLogLog(
+    std::uint8_t precision,
+    std::uint64_t hash_seed,
+    std::vector<std::uint8_t> registers)
+    : precision_(precision),
+      hash_seed_(hash_seed),
       registers_(std::move(registers)) {
     if (precision_ < kMinPrecision || precision_ > kMaxPrecision) {
         throw std::invalid_argument("invalid HyperLogLog precision");
@@ -90,7 +113,7 @@ HyperLogLog::HyperLogLog(std::uint8_t precision, std::vector<std::uint8_t> regis
 }
 
 void HyperLogLog::add(std::string_view value) {
-    const auto hash = avalanche(fnv1a64(value));
+    const auto hash = avalanche(fnv1a64(value, hash_seed_));
     const auto index = hash >> (64U - precision_);
     const auto remaining = hash << precision_;
     registers_[static_cast<std::size_t>(index)] =
@@ -100,6 +123,9 @@ void HyperLogLog::add(std::string_view value) {
 void HyperLogLog::merge(const HyperLogLog& other) {
     if (precision_ != other.precision_) {
         throw std::invalid_argument("cannot merge HyperLogLog sketches with different precision");
+    }
+    if (hash_seed_ != other.hash_seed_) {
+        throw std::invalid_argument("cannot merge HyperLogLog sketches with different hash seeds");
     }
 
     for (std::size_t index = 0; index < registers_.size(); ++index) {
@@ -132,6 +158,10 @@ double HyperLogLog::estimate() const {
 
 std::uint8_t HyperLogLog::precision() const noexcept {
     return precision_;
+}
+
+std::uint64_t HyperLogLog::hash_seed() const noexcept {
+    return hash_seed_;
 }
 
 std::uint32_t HyperLogLog::register_count() const noexcept {
