@@ -70,6 +70,7 @@ int main() {
     assert(skdb_open(":memory:", &db) == SKDB_OK);
     assert(db != nullptr);
     assert(std::strcmp(skdb_errmsg(db), "not an error") == 0);
+    assert(skdb_approx_memory_bytes(db) == 0);
 
     char* error_message = nullptr;
     int rc = skdb_exec(db, "select 1", nullptr, nullptr, &error_message);
@@ -89,7 +90,9 @@ int main() {
     assert(skdb_exec(
                db,
                "create table events(user_id varchar);"
-               "insert into events(user_id) values ('a'), ('b'), ('a'), ('c');",
+               "insert into events(user_id) values ('a'), ('b'), ('a'), ('c');"
+               "create table metrics(latency_ms double);"
+               "insert into metrics(latency_ms) values (10), (20), (30), (40), (50);",
                nullptr,
                nullptr,
                &error_message) == SKDB_OK);
@@ -127,6 +130,28 @@ int main() {
     assert(error_message == nullptr);
     assert(!approximate_count_after_insert.value.empty());
     assert(approximate_count_after_insert.value != approximate_count.value);
+    assert(skdb_approx_memory_bytes(db) > 0);
+#else
+    assert(rc == SKDB_ERROR);
+    assert(error_message != nullptr);
+    assert(std::strcmp(
+               error_message,
+               "DuckDB support is not compiled in; rebuild with SKDB_USE_DUCKDB=1") == 0);
+    skdb_free(error_message);
+#endif
+
+    error_message = nullptr;
+    SingleValue approximate_median;
+    rc = skdb_exec(
+        db,
+        "select APPROX_MEDIAN(latency_ms, 0.05, 0.90) from metrics",
+        capture_single_value,
+        &approximate_median,
+        &error_message);
+#ifdef SKDB_USE_DUCKDB
+    assert(rc == SKDB_OK);
+    assert(error_message == nullptr);
+    assert(!approximate_median.value.empty());
 #else
     assert(rc == SKDB_ERROR);
     assert(error_message != nullptr);

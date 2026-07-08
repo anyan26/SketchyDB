@@ -2,6 +2,7 @@
 
 #include "duckdb_backend.hpp"
 #include "hyperloglog.hpp"
+#include "kll_sketch.hpp"
 #include "planner.hpp"
 
 #include <cstdlib>
@@ -29,9 +30,20 @@ constexpr double kDefaultStreamingConfidence = 0.90;
 constexpr std::uint8_t kMaxHllPrecision = 24;
 
 struct HllCacheEntry;
+struct KllCacheEntry;
 
 struct HllCallbackState {
     HllCacheEntry* entry = nullptr;
+};
+
+struct KllCallbackState {
+    KllCacheEntry* entry = nullptr;
+};
+
+enum class ApproxImplementation {
+    HllCountDistinct,
+    KllQuantile,
+    Unknown,
 };
 
 struct HllCacheEntry {
@@ -61,6 +73,31 @@ struct HllCacheEntry {
     }
 };
 
+struct KllCacheEntry {
+    double epsilon = 0.0;
+    double confidence = 1.0;
+    std::uint32_t capacity = 0;
+    std::uint64_t seed = 0;
+    std::string source_table;
+    std::string source_column;
+    sketchydb::KllSketch sketch;
+
+    KllCacheEntry(
+        double epsilon,
+        double confidence,
+        std::uint32_t capacity,
+        std::uint64_t seed,
+        std::string table,
+        std::string column)
+        : epsilon(epsilon),
+          confidence(confidence),
+          capacity(capacity),
+          seed(seed),
+          source_table(std::move(table)),
+          source_column(std::move(column)),
+          sketch(capacity, seed) {}
+};
+
 }  // namespace
 
 struct skdb {
@@ -69,6 +106,7 @@ struct skdb {
     sketchydb::Planner planner;
     std::unique_ptr<sketchydb::DuckDBBackend> exact_backend;
     std::unordered_map<std::string, HllCacheEntry> hll_cache;
+    std::unordered_map<std::string, KllCacheEntry> kll_cache;
     std::uint64_t hash_seed = 0;
 };
 
@@ -119,6 +157,25 @@ int collect_hll_value(void* user_data, int column_count, char** column_values, c
     return 0;
 }
 
+int collect_kll_value(void* user_data, int column_count, char** column_values, char** column_names) {
+    (void)column_names;
+
+    auto* state = static_cast<KllCallbackState*>(user_data);
+    if (state == nullptr || state->entry == nullptr || column_count < 1) {
+        return 1;
+    }
+    if (column_values[0] == nullptr) {
+        return 0;
+    }
+
+    char* end = nullptr;
+    const double value = std::strtod(column_values[0], &end);
+    if (end != column_values[0] && *end == '\0') {
+        state->entry->sketch.add(value);
+    }
+    return 0;
+}
+
 int emit_single_value(skdb_callback callback, void* user_data, std::string value, const char* column_name) {
     if (callback == nullptr) {
         return SKDB_OK;
@@ -127,6 +184,31 @@ int emit_single_value(skdb_callback callback, void* user_data, std::string value
     char* values[] = {value.data()};
     char* names[] = {const_cast<char*>(column_name)};
     return callback(user_data, 1, values, names) == 0 ? SKDB_OK : SKDB_ERROR;
+}
+
+ApproxImplementation classify_approx_function(const std::string& function_name) {
+    if (function_name == "approx_count_distinct") {
+        return ApproxImplementation::HllCountDistinct;
+    }
+    if (function_name == "approx_25" ||
+        function_name == "approx_median" ||
+        function_name == "approx_75") {
+        return ApproxImplementation::KllQuantile;
+    }
+    return ApproxImplementation::Unknown;
+}
+
+double quantile_probability_for_function(const std::string& function_name) {
+    if (function_name == "approx_25") {
+        return 0.25;
+    }
+    if (function_name == "approx_median") {
+        return 0.50;
+    }
+    if (function_name == "approx_75") {
+        return 0.75;
+    }
+    return 0.0;
 }
 
 std::uint64_t parse_hash_seed_override() {
@@ -165,6 +247,14 @@ std::string hll_cache_key(
 
 std::string hll_cache_key(const sketchydb::Plan& plan, std::uint8_t precision) {
     return hll_cache_key(plan.approximate_function, plan.input_sql, precision);
+}
+
+std::string kll_cache_key(std::string_view input_sql, std::uint32_t capacity) {
+    return "kll|" + std::string(input_sql) + "|" + std::to_string(capacity);
+}
+
+std::string kll_input_sql(std::string_view table, std::string_view column) {
+    return "select " + std::string(column) + " as skdb_kll_value from " + std::string(table);
 }
 
 std::uint64_t stable_hash(std::string_view value) {
@@ -459,6 +549,111 @@ bool prewarm_streaming_hll_cache(skdb* db, const sketchydb::Plan& plan) {
     return prewarmed_any;
 }
 
+bool parse_double_value(const std::string& text, double& out_value) {
+    char* end = nullptr;
+    out_value = std::strtod(text.c_str(), &end);
+    return end != text.c_str() && *end == '\0';
+}
+
+bool add_inserted_values_to_kll_cache(skdb* db, const sketchydb::Plan& plan) {
+    if (plan.mutation_kind != sketchydb::MutationKind::InsertValues) {
+        return false;
+    }
+
+    bool handled_any = false;
+    for (auto& [key, entry] : db->kll_cache) {
+        (void)key;
+        if (entry.source_table != plan.mutation_table || entry.source_column.empty()) {
+            continue;
+        }
+
+        std::size_t column_index = 0;
+        if (!plan.insert_columns.empty()) {
+            bool found = false;
+            for (std::size_t index = 0; index < plan.insert_columns.size(); ++index) {
+                if (plan.insert_columns[index] == entry.source_column) {
+                    column_index = index;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                continue;
+            }
+        } else {
+            for (const auto& row : plan.insert_rows) {
+                if (row.size() != 1) {
+                    return false;
+                }
+            }
+            column_index = 0;
+        }
+
+        for (const auto& row : plan.insert_rows) {
+            double value = 0.0;
+            if (column_index >= row.size() || !parse_double_value(row[column_index], value)) {
+                return false;
+            }
+            entry.sketch.add(value);
+        }
+        handled_any = true;
+    }
+
+    return handled_any;
+}
+
+bool prewarm_streaming_kll_cache(skdb* db, const sketchydb::Plan& plan) {
+    if (plan.mutation_kind != sketchydb::MutationKind::InsertValues || plan.insert_columns.empty()) {
+        return false;
+    }
+
+    bool prewarmed_any = false;
+    const auto default_capacity = sketchydb::KllSketch::required_capacity(
+        kDefaultStreamingEpsilon,
+        kDefaultStreamingConfidence);
+
+    for (std::size_t column_index = 0; column_index < plan.insert_columns.size(); ++column_index) {
+        const auto& column = plan.insert_columns[column_index];
+        if (column.empty()) {
+            continue;
+        }
+
+        const auto input_sql = kll_input_sql(plan.mutation_table, column);
+        const auto cache_key = kll_cache_key(input_sql, default_capacity);
+        if (db->kll_cache.find(cache_key) != db->kll_cache.end()) {
+            continue;
+        }
+
+        auto inserted = db->kll_cache.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(cache_key),
+            std::forward_as_tuple(
+                kDefaultStreamingEpsilon,
+                kDefaultStreamingConfidence,
+                default_capacity,
+                db->hash_seed,
+                plan.mutation_table,
+                column));
+
+        bool saw_numeric_value = false;
+        for (const auto& row : plan.insert_rows) {
+            double value = 0.0;
+            if (column_index < row.size() && parse_double_value(row[column_index], value)) {
+                inserted.first->second.sketch.add(value);
+                saw_numeric_value = true;
+            }
+        }
+
+        if (saw_numeric_value) {
+            prewarmed_any = true;
+        } else {
+            db->kll_cache.erase(inserted.first);
+        }
+    }
+
+    return prewarmed_any;
+}
+
 std::string hll_cache_key_for_precision(const sketchydb::Plan& plan, std::uint8_t precision) {
     return hll_cache_key(plan, precision);
 }
@@ -505,6 +700,49 @@ std::pair<std::string, HllCacheEntry*> load_sufficient_hll_cache(
     }
 
     return {"", nullptr};
+}
+
+std::pair<std::string, KllCacheEntry*> find_sufficient_kll_cache(
+    skdb* db,
+    const sketchydb::Plan& plan,
+    std::uint32_t required_capacity) {
+    std::pair<std::string, KllCacheEntry*> best{"", nullptr};
+    for (auto& [key, entry] : db->kll_cache) {
+        if (entry.source_table == plan.source_table &&
+            entry.source_column == plan.source_column &&
+            entry.seed == db->hash_seed &&
+            entry.capacity >= required_capacity) {
+            if (best.second == nullptr || entry.capacity < best.second->capacity) {
+                best = {key, &entry};
+            }
+        }
+    }
+    return best;
+}
+
+std::string kll_cache_key_for_capacity(const sketchydb::Plan& plan, std::uint32_t capacity) {
+    return kll_cache_key(plan.input_sql, capacity);
+}
+
+std::uint64_t hll_cache_entry_memory_bytes(const HllCacheEntry& entry) {
+    auto bytes = static_cast<std::uint64_t>(sizeof(HllCacheEntry));
+    bytes += static_cast<std::uint64_t>(entry.source_table.capacity());
+    bytes += static_cast<std::uint64_t>(entry.source_column.capacity());
+    bytes += static_cast<std::uint64_t>(entry.partitions.capacity() * sizeof(sketchydb::HyperLogLog));
+
+    for (const auto& partition : entry.partitions) {
+        bytes += static_cast<std::uint64_t>(partition.registers().capacity());
+    }
+
+    return bytes;
+}
+
+std::uint64_t kll_cache_entry_memory_bytes(const KllCacheEntry& entry) {
+    auto bytes = static_cast<std::uint64_t>(sizeof(KllCacheEntry));
+    bytes += static_cast<std::uint64_t>(entry.source_table.capacity());
+    bytes += static_cast<std::uint64_t>(entry.source_column.capacity());
+    bytes += entry.sketch.memory_bytes();
+    return bytes;
 }
 
 }  // namespace
@@ -559,11 +797,55 @@ int skdb_exec(
         if (!plan.error_message.empty()) {
             return set_error(db, error_message, plan.error_message);
         }
-        if (plan.approximate_function != "approx_count_distinct") {
+        const auto implementation = classify_approx_function(plan.approximate_function);
+        if (implementation == ApproxImplementation::Unknown) {
             return set_error(
                 db,
                 error_message,
-                plan.approximate_function + " is recognized but not implemented yet");
+                plan.approximate_function + " is not a supported SketchyDB approximate function yet");
+        }
+        if (implementation == ApproxImplementation::KllQuantile) {
+            const auto required_capacity =
+                sketchydb::KllSketch::required_capacity(plan.epsilon, plan.confidence);
+            auto [cache_key, cached] = find_sufficient_kll_cache(db, plan, required_capacity);
+            if (cached == nullptr) {
+                cache_key = kll_cache_key_for_capacity(plan, required_capacity);
+                auto inserted = db->kll_cache.emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(cache_key),
+                    std::forward_as_tuple(
+                        plan.epsilon,
+                        plan.confidence,
+                        required_capacity,
+                        db->hash_seed,
+                        plan.source_table,
+                        plan.source_column));
+                cached = &inserted.first->second;
+
+                KllCallbackState state{.entry = cached};
+                std::string error;
+                int rc = db->exact_backend->exec(
+                    plan.input_sql.c_str(),
+                    collect_kll_value,
+                    &state,
+                    error);
+                if (rc != SKDB_OK) {
+                    db->kll_cache.erase(cache_key);
+                    return set_error(db, error_message, error);
+                }
+            }
+
+            int rc = emit_single_value(
+                callback,
+                user_data,
+                std::to_string(cached->sketch.quantile(quantile_probability_for_function(plan.approximate_function))),
+                plan.approximate_function.c_str());
+            if (rc != SKDB_OK) {
+                return set_error(db, error_message, "query aborted by callback");
+            }
+
+            db->last_error.clear();
+            return SKDB_OK;
         }
 
         const auto required_precision =
@@ -623,16 +905,19 @@ int skdb_exec(
     if (plan.mutation_kind == sketchydb::MutationKind::InsertValues) {
         const bool updated_existing = add_inserted_values_to_hll_cache(db, plan);
         const bool prewarmed = prewarm_streaming_hll_cache(db, plan);
+        const bool updated_existing_kll = add_inserted_values_to_kll_cache(db, plan);
+        const bool prewarmed_kll = prewarm_streaming_kll_cache(db, plan);
         for (const auto& [cache_key, entry] : db->hll_cache) {
             save_hll_entry(db, cache_key, entry);
         }
-        if (updated_existing || prewarmed) {
+        if (updated_existing || prewarmed || updated_existing_kll || prewarmed_kll) {
             db->last_error.clear();
             return SKDB_OK;
         }
     }
     if (plan.invalidates_sketches) {
         db->hll_cache.clear();
+        db->kll_cache.clear();
         invalidate_persisted_sketches(db);
     }
 
@@ -648,6 +933,27 @@ const char* skdb_errmsg(skdb* db) {
         return "not an error";
     }
     return db->last_error.c_str();
+}
+
+std::uint64_t skdb_approx_memory_bytes(skdb* db) {
+    if (db == nullptr) {
+        return 0;
+    }
+
+    auto bytes = static_cast<std::uint64_t>(db->hll_cache.bucket_count() * sizeof(void*));
+    for (const auto& [cache_key, entry] : db->hll_cache) {
+        bytes += static_cast<std::uint64_t>(sizeof(void*) * 2);
+        bytes += static_cast<std::uint64_t>(sizeof(std::string) + cache_key.capacity());
+        bytes += hll_cache_entry_memory_bytes(entry);
+    }
+    bytes += static_cast<std::uint64_t>(db->kll_cache.bucket_count() * sizeof(void*));
+    for (const auto& [cache_key, entry] : db->kll_cache) {
+        bytes += static_cast<std::uint64_t>(sizeof(void*) * 2);
+        bytes += static_cast<std::uint64_t>(sizeof(std::string) + cache_key.capacity());
+        bytes += kll_cache_entry_memory_bytes(entry);
+    }
+
+    return bytes;
 }
 
 void skdb_free(void* ptr) {

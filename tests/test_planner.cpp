@@ -13,13 +13,17 @@ void assert_exact(std::string sql) {
     assert(plan.approximate_function.empty());
 }
 
-void assert_approx_count_distinct(std::string sql) {
+void assert_approx_function(std::string sql, std::string expected_function) {
     sketchydb::Planner planner;
     auto plan = planner.plan(sql);
 
     assert(plan.mode == sketchydb::ExecutionMode::Approximate);
-    assert(plan.approximate_function == "approx_count_distinct");
+    assert(plan.approximate_function == expected_function);
     assert(plan.error_message.empty());
+}
+
+void assert_approx_count_distinct(std::string sql) {
+    assert_approx_function(sql, "approx_count_distinct");
 }
 
 void assert_invalid_approx(std::string sql, std::string expected_error) {
@@ -38,6 +42,12 @@ void recognizes_function_style_approximate_query() {
 void recognizes_function_case_insensitively() {
     assert_approx_count_distinct("select APPROX_COUNT_DISTINCT(user_id, 0.01, 0.99) from events");
     assert_approx_count_distinct("select ApPrOx_CoUnT_DiStInCt(user_id, 0.01, 0.99) from events");
+}
+
+void recognizes_quantile_functions() {
+    assert_approx_function("select approx_25(latency_ms, 0.01, 0.99) from events", "approx_25");
+    assert_approx_function("select approx_median(latency_ms, 0.01, 0.99) from events", "approx_median");
+    assert_approx_function("select approx_75(latency_ms, 0.01, 0.99) from events", "approx_75");
 }
 
 void allows_whitespace_before_function_arguments() {
@@ -191,6 +201,7 @@ void table_and_column_names_with_approx_prefix_stay_exact() {
 int main() {
     recognizes_function_style_approximate_query();
     recognizes_function_case_insensitively();
+    recognizes_quantile_functions();
     allows_whitespace_before_function_arguments();
     captures_epsilon_and_confidence();
     rejects_missing_epsilon_and_confidence();

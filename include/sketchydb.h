@@ -1,6 +1,8 @@
 #ifndef SKETCHYDB_H
 #define SKETCHYDB_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -28,6 +30,7 @@ int skdb_exec(
     char** error_message);
 
 const char* skdb_errmsg(skdb* db);
+uint64_t skdb_approx_memory_bytes(skdb* db);
 void skdb_free(void* ptr);
 const char* skdb_libversion(void);
 

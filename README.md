@@ -21,7 +21,9 @@ This is based on the belief that most DB operations are simple and repetitive. A
 
 ## Pending Features
 ### Approx_quantile, median, p96
-KLL sketch
+KLL sketch. `APPROX_25(x, epsilon, confidence)`,
+`APPROX_MEDIAN(x, epsilon, confidence)`, and
+`APPROX_75(x, epsilon, confidence)` are implemented for numeric inputs.
 
 ### Heavy Hitters 
 Find the most frequent items in massive dataset without counting everything.
@@ -73,6 +75,7 @@ Current layout:
 - `src/sketchydb.cpp`: opaque database handle and API implementation.
 - `src/planner.cpp`: the first decision point for exact vs approximate plans.
 - `src/hyperloglog.cpp`: partitionable HyperLogLog implementation.
+- `src/kll_sketch.cpp`: KLL quantile sketch implementation.
 - `src/duckdb_backend.cpp`: exact execution adapter for DuckDB.
 - `shell/shell.cpp`: tiny interactive shell.
 - `tests/test_smoke.cpp`: smoke test for opening, executing, errors, and closing.
@@ -81,6 +84,14 @@ First SketchyDB-specific SQL shape:
 
 ```sql
 SELECT APPROX_COUNT_DISTINCT(user_id, 0.01, 0.99) FROM events;
+```
+
+Quantile sketches:
+
+```sql
+SELECT APPROX_25(latency_ms, 0.01, 0.99) FROM events;
+SELECT APPROX_MEDIAN(latency_ms, 0.01, 0.99) FROM events;
+SELECT APPROX_75(latency_ms, 0.01, 0.99) FROM events;
 ```
 
 The second argument is `epsilon`, the tolerated error bound, and the third
@@ -108,6 +119,14 @@ invalidate cached and persisted sketches so the next approximate query rebuilds
 from DuckDB. HyperLogLog is append-friendly but not delete/update-friendly, so
 this keeps results safe while the mutation parser stays small.
 
+`APPROX_25`, `APPROX_MEDIAN`, and `APPROX_75` currently use an in-memory KLL
+sketch for numeric values. The three functions share a single cached KLL sketch
+for the same expression and accuracy bounds, then ask that sketch for different
+quantiles. Simple numeric `INSERT INTO table [(columns)] VALUES (...)` streams
+into matching or default KLL sketches. KLL persistence is not implemented yet,
+so file-backed databases currently persist HLL sketches but rebuild KLL sketches
+after reopen.
+
 ## Benchmark Snapshot
 Run:
 
@@ -133,20 +152,54 @@ inserts over a 100,000-value user id domain:
 
 ```text
 trials=5 rows=500000 distinct_domain=100000 batch_size=1000 seed=1337
-duckdb_insert_stream_mean_ms=1347.63 median_ms=1345.91
-sketchydb_insert_stream_with_hll_mean_ms=1436.39 median_ms=1426.36
-duckdb_count_distinct_mean_ms=4.85041 median_ms=3.93975
-sketchydb_hll_first_after_stream_insert_mean_ms=0.0414832 median_ms=0.039709
-sketchydb_hll_cached_mean_ms=0.0334334 median_ms=0.031583
-insert_overhead_mean_ms=88.7539
-hll_read_speedup_vs_duckdb_mean_x=116.925
-cached_hll_read_speedup_vs_duckdb_mean_x=145.077
-break_even_approx_queries_after_ingest=18.4561
+duckdb_insert_stream_mean_ms=1379.43 median_ms=1367.24
+sketchydb_insert_stream_with_hll_mean_ms=1441.33 median_ms=1409.01
+duckdb_count_distinct_mean_ms=5.69106 median_ms=4.00879
+sketchydb_hll_first_after_stream_insert_mean_ms=0.040992 median_ms=0.041375
+sketchydb_hll_cached_mean_ms=0.033408 median_ms=0.031583
+insert_overhead_mean_ms=61.9027
+hll_read_speedup_vs_duckdb_mean_x=138.833
+cached_hll_read_speedup_vs_duckdb_mean_x=170.35
+break_even_approx_queries_after_ingest=10.9561
+sketchydb_approx_memory_mean_bytes=66147 median_bytes=66147 mean_mib=0.0630827
 exact_count=99351 approx_count=99859.5 relative_error=0.00511795
 ```
 
-The insert path paid about 89 ms of extra sketch-maintenance cost over raw
+The insert path paid about 62 ms of extra sketch-maintenance cost over raw
 DuckDB insertion in this run. After that, `APPROX_COUNT_DISTINCT(user_id, 0.05,
-0.90)` was already cache-backed and read about 117x faster than DuckDB's exact
+0.90)` was already cache-backed and read about 139x faster than DuckDB's exact
 `COUNT(DISTINCT)`. In this workload, the streaming sketch pays for itself after
-about 19 approximate reads over the ingested data.
+about 11 approximate reads over the ingested data. The memory metric estimates
+SketchyDB's additional sketch/cache memory only; it does not include DuckDB's
+storage, execution memory, or allocator bookkeeping.
+
+KLL quantile benchmark:
+
+```bash
+make perf_kll \
+  SKDB_USE_DUCKDB=1 \
+  DUCKDB_PREFIX=/Users/anyan/libduckdb-osx-universal \
+  SKDB_HASH_SEED=424242 \
+  PERF_TRIALS=5 \
+  PERF_ROWS=500000 \
+  PERF_DISTINCT=100000 \
+  PERF_BATCH_SIZE=1000 \
+  PERF_SEED=1337
+```
+
+Latest local result:
+
+```text
+trials=5 rows=500000 distinct_domain=100000 batch_size=1000 seed=1337
+duckdb_insert_stream_mean_ms=1330.05 median_ms=1332.25
+sketchydb_insert_stream_with_kll_mean_ms=1406.11 median_ms=1406.01
+duckdb_exact_median_mean_ms=6.71169 median_ms=6.61533
+sketchydb_kll_first_after_stream_insert_mean_ms=0.0165416 median_ms=0.016
+sketchydb_kll_cached_mean_ms=0.005825 median_ms=0.005791
+insert_overhead_mean_ms=76.0659
+kll_read_speedup_vs_duckdb_mean_x=405.746
+cached_kll_read_speedup_vs_duckdb_mean_x=1152.22
+break_even_approx_queries_after_ingest=11.3613
+sketchydb_approx_memory_mean_bytes=75054 median_bytes=75054 mean_mib=0.0715771
+exact_median=49894.5 approx_25=25943 approx_median=51073 approx_75=75858 median_relative_error=0.0236198
+```
