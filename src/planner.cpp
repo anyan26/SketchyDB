@@ -33,6 +33,8 @@ struct ApproxCall {
     std::string input_sql;
     std::string source_table;
     std::string source_column;
+    std::string target_value;
+    std::uint64_t top_k = 0;
     double epsilon = 0.0;
     double confidence = 1.0;
     std::string error_message;
@@ -282,6 +284,13 @@ bool parse_number(std::string_view value, double& out_number) {
     return end != owned.c_str() && *end == '\0';
 }
 
+bool parse_uint64(std::string_view value, std::uint64_t& out_number) {
+    std::string owned(value);
+    char* end = nullptr;
+    out_number = std::strtoull(owned.c_str(), &end, 10);
+    return end != owned.c_str() && *end == '\0';
+}
+
 std::string parse_simple_column(
     const std::vector<Token>& tokens,
     std::size_t expression_start,
@@ -317,6 +326,29 @@ std::string parse_source_table_after(const std::vector<Token>& tokens, std::size
     return "";
 }
 
+bool is_single_value_token(
+    const std::vector<Token>& tokens,
+    std::size_t argument_start,
+    std::size_t argument_end,
+    std::string& value) {
+    std::vector<Token> argument_tokens;
+    for (const auto& token : tokens) {
+        if (token.start >= argument_start && token.end <= argument_end) {
+            argument_tokens.push_back(token);
+        }
+    }
+    if (argument_tokens.size() != 1) {
+        return false;
+    }
+    if (argument_tokens[0].kind != TokenKind::String &&
+        argument_tokens[0].kind != TokenKind::Number &&
+        argument_tokens[0].kind != TokenKind::Identifier) {
+        return false;
+    }
+    value = argument_tokens[0].text;
+    return true;
+}
+
 ApproxCall parse_approx_arguments(
     std::string_view sql,
     const std::vector<Token>& tokens,
@@ -339,10 +371,15 @@ ApproxCall parse_approx_arguments(
         }
     }
 
-    if (top_level_commas.size() != 2) {
+    const bool is_freq = function_name == "approx_freq";
+    const bool is_top_k = function_name == "approx_top_k";
+    const std::size_t expected_commas = is_freq || is_top_k ? 3 : 2;
+    if (top_level_commas.size() != expected_commas) {
         return ApproxCall{
             .function_name = function_name,
-            .error_message = function_name + " expects exactly 3 arguments: expression, epsilon, confidence",
+            .error_message = function_name + (expected_commas == 3
+                ? " expects exactly 4 arguments"
+                : " expects exactly 3 arguments: expression, epsilon, confidence"),
         };
     }
 
@@ -355,9 +392,40 @@ ApproxCall parse_approx_arguments(
         };
     }
 
-    const auto epsilon_index = top_level_commas[0] + 1;
-    const auto confidence_index = top_level_commas[1] + 1;
-    if (epsilon_index >= top_level_commas[1] || tokens[epsilon_index].kind != TokenKind::Number) {
+    std::string target_value;
+    std::uint64_t top_k = 0;
+    std::size_t epsilon_comma_index = 0;
+    std::size_t confidence_comma_index = 1;
+    if (is_freq) {
+        const auto target_start = tokens[top_level_commas[0]].end;
+        const auto target_end = tokens[top_level_commas[1]].start;
+        if (!is_single_value_token(tokens, target_start, target_end, target_value)) {
+            return ApproxCall{
+                .function_name = function_name,
+                .error_message = function_name + " target value must be a single string, number, or identifier literal",
+            };
+        }
+        epsilon_comma_index = 1;
+        confidence_comma_index = 2;
+    } else if (is_top_k) {
+        const auto k_index = top_level_commas[0] + 1;
+        if (k_index >= top_level_commas[1] ||
+            tokens[k_index].kind != TokenKind::Number ||
+            k_index + 1 != top_level_commas[1] ||
+            !parse_uint64(tokens[k_index].text, top_k) ||
+            top_k == 0) {
+            return ApproxCall{
+                .function_name = function_name,
+                .error_message = function_name + " k must be a positive integer literal",
+            };
+        }
+        epsilon_comma_index = 1;
+        confidence_comma_index = 2;
+    }
+
+    const auto epsilon_index = top_level_commas[epsilon_comma_index] + 1;
+    const auto confidence_index = top_level_commas[confidence_comma_index] + 1;
+    if (epsilon_index >= top_level_commas[confidence_comma_index] || tokens[epsilon_index].kind != TokenKind::Number) {
         return ApproxCall{
             .function_name = function_name,
             .error_message = function_name + " epsilon must be a number in (0, 1]",
@@ -372,7 +440,7 @@ ApproxCall parse_approx_arguments(
         };
     }
 
-    if (epsilon_index + 1 != top_level_commas[1]) {
+    if (epsilon_index + 1 != top_level_commas[confidence_comma_index]) {
         return ApproxCall{
             .function_name = function_name,
             .error_message = function_name + " epsilon must be a single numeric literal",
@@ -408,6 +476,8 @@ ApproxCall parse_approx_arguments(
                      " as skdb_hll_value" + std::string(sql.substr(tokens[right_paren].end)),
         .source_table = parse_source_table_after(tokens, right_paren + 1),
         .source_column = parse_simple_column(tokens, expression_start, expression_end),
+        .target_value = std::move(target_value),
+        .top_k = top_k,
         .epsilon = epsilon,
         .confidence = confidence,
     };
@@ -485,13 +555,48 @@ std::vector<std::string> parse_insert_row(
     return values;
 }
 
-Plan parse_insert_values_plan(const std::vector<Token>& tokens) {
+bool parse_approx_insert_hint(const std::vector<Token>& tokens, std::size_t hint_index, Plan& plan, std::size_t& after_hint) {
+    if (hint_index + 2 >= tokens.size() ||
+        tokens[hint_index].kind != TokenKind::Identifier ||
+        !equals_ignore_case(tokens[hint_index].text, "approx_hint") ||
+        tokens[hint_index + 1].kind != TokenKind::LeftParen ||
+        tokens[hint_index + 2].kind != TokenKind::LeftParen) {
+        return false;
+    }
+
+    const auto columns_end = skip_parenthesized_group(tokens, hint_index + 2);
+    if (columns_end == tokens.size() || columns_end + 5 >= tokens.size()) {
+        return false;
+    }
+    if (tokens[columns_end + 1].kind != TokenKind::Comma ||
+        tokens[columns_end + 2].kind != TokenKind::Number ||
+        tokens[columns_end + 3].kind != TokenKind::Comma ||
+        tokens[columns_end + 4].kind != TokenKind::Number ||
+        tokens[columns_end + 5].kind != TokenKind::RightParen) {
+        return false;
+    }
+
+    double epsilon = 0.0;
+    double confidence = 0.0;
+    if (!parse_number(tokens[columns_end + 2].text, epsilon) ||
+        !parse_number(tokens[columns_end + 4].text, confidence) ||
+        epsilon <= 0.0 || epsilon > 1.0 ||
+        confidence <= 0.0 || confidence > 1.0) {
+        return false;
+    }
+
+    plan.has_approx_hint = true;
+    plan.approx_hint_columns = parse_identifier_list(tokens, hint_index + 2, columns_end);
+    plan.approx_hint_epsilon = epsilon;
+    plan.approx_hint_confidence = confidence;
+    after_hint = columns_end + 6;
+    return !plan.approx_hint_columns.empty();
+}
+
+Plan parse_insert_values_plan(std::string_view sql, const std::vector<Token>& tokens) {
     if (tokens.size() < 4 ||
         tokens[0].kind != TokenKind::Identifier ||
-        !equals_ignore_case(tokens[0].text, "insert") ||
-        tokens[1].kind != TokenKind::Identifier ||
-        !equals_ignore_case(tokens[1].text, "into") ||
-        tokens[2].kind != TokenKind::Identifier) {
+        !equals_ignore_case(tokens[0].text, "insert")) {
         return Plan{
             .mode = ExecutionMode::Exact,
             .invalidates_sketches = true,
@@ -502,11 +607,32 @@ Plan parse_insert_values_plan(const std::vector<Token>& tokens) {
     Plan plan{
         .mode = ExecutionMode::Exact,
         .invalidates_sketches = true,
-        .mutation_kind = MutationKind::InsertValues,
-        .mutation_table = lowercase(tokens[2].text),
+        .mutation_kind = MutationKind::Other,
     };
 
-    std::size_t index = 3;
+    std::size_t into_index = 1;
+    if (into_index < tokens.size() &&
+        tokens[into_index].kind == TokenKind::Identifier &&
+        equals_ignore_case(tokens[into_index].text, "approx_hint")) {
+        if (!parse_approx_insert_hint(tokens, into_index, plan, into_index)) {
+            return plan;
+        }
+    }
+
+    if (into_index + 1 >= tokens.size() ||
+        tokens[into_index].kind != TokenKind::Identifier ||
+        !equals_ignore_case(tokens[into_index].text, "into") ||
+        tokens[into_index + 1].kind != TokenKind::Identifier) {
+        return plan;
+    }
+
+    plan.mutation_kind = MutationKind::InsertValues;
+    plan.mutation_table = lowercase(tokens[into_index + 1].text);
+
+    if (plan.has_approx_hint) {
+        plan.sql_to_execute = "insert " + std::string(sql.substr(tokens[into_index].start));
+    }
+    std::size_t index = into_index + 2;
     if (index < tokens.size() && tokens[index].kind == TokenKind::LeftParen) {
         const auto columns_end = skip_parenthesized_group(tokens, index);
         if (columns_end == tokens.size()) {
@@ -563,6 +689,13 @@ Plan Planner::plan(std::string_view sql) const {
     //   -> use sketches / sampling / cached metadata
     //   -> fall back to DuckDB when needed
     //
+    const auto tokens = tokenize_sql(sql);
+    if (!tokens.empty() &&
+        tokens[0].kind == TokenKind::Identifier &&
+        equals_ignore_case(tokens[0].text, "insert")) {
+        return parse_insert_values_plan(sql, tokens);
+    }
+
     auto approximate_call = parse_approx_function(sql);
     if (!approximate_call.function_name.empty()) {
         return Plan{
@@ -571,17 +704,12 @@ Plan Planner::plan(std::string_view sql) const {
             .input_sql = std::move(approximate_call.input_sql),
             .source_table = std::move(approximate_call.source_table),
             .source_column = std::move(approximate_call.source_column),
+            .target_value = std::move(approximate_call.target_value),
+            .top_k = approximate_call.top_k,
             .epsilon = approximate_call.epsilon,
             .confidence = approximate_call.confidence,
             .error_message = std::move(approximate_call.error_message),
         };
-    }
-
-    const auto tokens = tokenize_sql(sql);
-    if (!tokens.empty() &&
-        tokens[0].kind == TokenKind::Identifier &&
-        equals_ignore_case(tokens[0].text, "insert")) {
-        return parse_insert_values_plan(tokens);
     }
 
     if (contains_mutation_statement(tokens)) {

@@ -25,12 +25,10 @@ KLL sketch. `APPROX_25(x, epsilon, confidence)`,
 `APPROX_MEDIAN(x, epsilon, confidence)`, and
 `APPROX_75(x, epsilon, confidence)` are implemented for numeric inputs.
 
-### Heavy Hitters 
-Find the most frequent items in massive dataset without counting everything.
-Count-Min Sketch + heap
-
-### APPROX_FREQ(x)
-Count-MIn sketch
+### Frequency and heavy hitters
+`APPROX_FREQ(x, target, epsilon, confidence)` is implemented with Count-Min
+Sketch. `APPROX_TOP_K(x, k, epsilon, confidence)` is implemented with a
+Space-Saving candidate table.
 
 ### Approx_Join_Size 
 bottom-k / MinHash sketch
@@ -76,6 +74,7 @@ Current layout:
 - `src/planner.cpp`: the first decision point for exact vs approximate plans.
 - `src/hyperloglog.cpp`: partitionable HyperLogLog implementation.
 - `src/kll_sketch.cpp`: KLL quantile sketch implementation.
+- `src/frequency_sketch.cpp`: Count-Min Sketch and Space-Saving top-k implementation.
 - `src/duckdb_backend.cpp`: exact execution adapter for DuckDB.
 - `shell/shell.cpp`: tiny interactive shell.
 - `tests/test_smoke.cpp`: smoke test for opening, executing, errors, and closing.
@@ -93,6 +92,25 @@ SELECT APPROX_25(latency_ms, 0.01, 0.99) FROM events;
 SELECT APPROX_MEDIAN(latency_ms, 0.01, 0.99) FROM events;
 SELECT APPROX_75(latency_ms, 0.01, 0.99) FROM events;
 ```
+
+Frequency sketches:
+
+```sql
+SELECT APPROX_FREQ(user_id, 'user-123', 0.01, 0.99) FROM events;
+SELECT APPROX_TOP_K(user_id, 10, 0.01, 0.99) FROM events;
+```
+
+Insert hints:
+
+```sql
+INSERT APPROX_HINT((user_id, latency_ms), 0.01, 0.99)
+INTO events(user_id, latency_ms)
+VALUES ('user-123', 42.0);
+```
+
+`APPROX_HINT((columns...), epsilon, confidence)` tells SketchyDB to maintain
+streaming sketches for the listed inserted columns at the requested bounds
+while sending a normal `INSERT INTO ...` statement to DuckDB.
 
 The second argument is `epsilon`, the tolerated error bound, and the third
 argument is `confidence`, the probability target for satisfying that bound.
@@ -119,13 +137,18 @@ invalidate cached and persisted sketches so the next approximate query rebuilds
 from DuckDB. HyperLogLog is append-friendly but not delete/update-friendly, so
 this keeps results safe while the mutation parser stays small.
 
-`APPROX_25`, `APPROX_MEDIAN`, and `APPROX_75` currently use an in-memory KLL
-sketch for numeric values. The three functions share a single cached KLL sketch
-for the same expression and accuracy bounds, then ask that sketch for different
-quantiles. Simple numeric `INSERT INTO table [(columns)] VALUES (...)` streams
-into matching or default KLL sketches. KLL persistence is not implemented yet,
-so file-backed databases currently persist HLL sketches but rebuild KLL sketches
-after reopen.
+`APPROX_25`, `APPROX_MEDIAN`, and `APPROX_75` use a KLL sketch for numeric
+values. The three functions share a single cached KLL sketch for the same
+expression and accuracy bounds, then ask that sketch for different quantiles.
+Simple numeric `INSERT INTO table [(columns)] VALUES (...)` streams into
+matching or default KLL sketches. File-backed databases persist KLL sketches
+under `<database>.sketchydb`.
+
+`APPROX_FREQ` and `APPROX_TOP_K` use frequency summaries. `APPROX_FREQ` returns
+one estimated count for the target value. `APPROX_TOP_K` returns rows with
+`value`, `estimate`, and `error` columns. Simple `INSERT INTO table [(columns)]
+VALUES (...)` streams values into matching or default frequency summaries.
+File-backed databases persist frequency summaries under `<database>.sketchydb`.
 
 ## Benchmark Snapshot
 Run:
@@ -202,4 +225,74 @@ cached_kll_read_speedup_vs_duckdb_mean_x=1152.22
 break_even_approx_queries_after_ingest=11.3613
 sketchydb_approx_memory_mean_bytes=75054 median_bytes=75054 mean_mib=0.0715771
 exact_median=49894.5 approx_25=25943 approx_median=51073 approx_75=75858 median_relative_error=0.0236198
+```
+
+Large-scale KLL run, using 5 trials of 50,000,000 streamed rows over the same
+100,000-value domain:
+
+```bash
+make perf_kll \
+  SKDB_USE_DUCKDB=1 \
+  DUCKDB_PREFIX=/Users/anyan/libduckdb-osx-universal \
+  SKDB_HASH_SEED=424242 \
+  PERF_TRIALS=5 \
+  PERF_ROWS=50000000 \
+  PERF_DISTINCT=100000 \
+  PERF_BATCH_SIZE=1000 \
+  PERF_SEED=1337
+```
+
+These large runs take a while on a local laptop, so they are not part of the
+routine verification loop for now. They are useful stress experiments, though:
+as table size grows, exact DuckDB scans get much more expensive while sketch
+reads stay tiny, so we should see substantially larger improvements than in the
+500k-row benchmark.
+
+```text
+trials=5 rows=50000000 distinct_domain=100000 batch_size=1000 seed=1337
+duckdb_insert_stream_mean_ms=125857 median_ms=126548
+sketchydb_insert_stream_with_kll_mean_ms=133321 median_ms=133186
+duckdb_exact_median_mean_ms=1165.62 median_ms=1153.87
+sketchydb_kll_first_after_stream_insert_mean_ms=0.12165 median_ms=0.056666
+sketchydb_kll_cached_mean_ms=0.0091168 median_ms=0.007875
+insert_overhead_mean_ms=7464.84
+kll_read_speedup_vs_duckdb_mean_x=9581.78
+cached_kll_read_speedup_vs_duckdb_mean_x=127854
+break_even_approx_queries_after_ingest=6.40483
+sketchydb_approx_memory_mean_bytes=6.30222e+06 median_bytes=6.30222e+06 mean_mib=6.01027
+exact_median=49996 approx_25=25601 approx_median=50419 approx_75=75879 median_relative_error=0.00846068
+```
+
+Frequency benchmark:
+
+```bash
+make perf_freq \
+  SKDB_USE_DUCKDB=1 \
+  DUCKDB_PREFIX=/Users/anyan/libduckdb-osx-universal \
+  SKDB_HASH_SEED=424242 \
+  PERF_TRIALS=5 \
+  PERF_ROWS=500000 \
+  PERF_DISTINCT=100000 \
+  PERF_BATCH_SIZE=1000 \
+  PERF_SEED=1337
+```
+
+Latest local result, using a skewed distribution with three hot keys and a
+large uniform tail:
+
+```text
+trials=5 rows=500000 distinct_domain=100000 batch_size=1000 seed=1337
+duckdb_insert_stream_mean_ms=1466.13 median_ms=1454.86
+sketchydb_insert_stream_with_frequency_mean_ms=1559.25 median_ms=1548.51
+duckdb_exact_frequency_mean_ms=1.67552 median_ms=1.67596
+sketchydb_approx_frequency_mean_ms=0.0034414 median_ms=0.003333
+duckdb_exact_top_k_mean_ms=5.65492 median_ms=5.63737
+sketchydb_approx_top_k_mean_ms=0.0060168 median_ms=0.006
+insert_overhead_mean_ms=93.116
+freq_read_speedup_vs_duckdb_mean_x=486.871
+topk_read_speedup_vs_duckdb_mean_x=939.855
+freq_break_even_approx_queries_after_ingest=55.6889
+topk_break_even_approx_queries_after_ingest=16.4839
+sketchydb_approx_memory_mean_bytes=69733 median_bytes=69733 mean_mib=0.0665026
+exact_frequency=100652 approx_frequency=105872 freq_relative_error=0.0518619 approx_topk_rows=10
 ```

@@ -12,6 +12,7 @@ public:
 
     KllSketch(double epsilon, double confidence, std::uint64_t seed);
     KllSketch(std::uint32_t capacity, std::uint64_t seed);
+    KllSketch(std::uint32_t capacity, std::uint64_t seed, std::uint64_t count, std::vector<std::vector<double>> levels);
 
     void add(double value);
     [[nodiscard]] double quantile(double probability) const;
@@ -19,6 +20,7 @@ public:
     [[nodiscard]] std::uint32_t capacity() const noexcept;
     [[nodiscard]] std::uint64_t seed() const noexcept;
     [[nodiscard]] std::uint64_t memory_bytes() const noexcept;
+    [[nodiscard]] const std::vector<std::vector<double>>& levels() const noexcept;
 
 private:
     void compact_level(std::size_t level);

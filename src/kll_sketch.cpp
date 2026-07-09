@@ -48,6 +48,21 @@ KllSketch::KllSketch(std::uint32_t capacity, std::uint64_t seed)
     levels_.front().reserve(capacity_);
 }
 
+KllSketch::KllSketch(
+    std::uint32_t capacity,
+    std::uint64_t seed,
+    std::uint64_t count,
+    std::vector<std::vector<double>> levels)
+    : capacity_(std::clamp(capacity, kMinCapacity, kMaxCapacity)),
+      seed_(seed),
+      count_(count),
+      random_(splitmix64(seed)),
+      levels_(std::move(levels)) {
+    if (levels_.empty()) {
+        levels_.emplace_back();
+    }
+}
+
 void KllSketch::add(double value) {
     if (!std::isfinite(value)) {
         return;
@@ -111,6 +126,10 @@ std::uint64_t KllSketch::memory_bytes() const noexcept {
         bytes += static_cast<std::uint64_t>(level.capacity() * sizeof(double));
     }
     return bytes;
+}
+
+const std::vector<std::vector<double>>& KllSketch::levels() const noexcept {
+    return levels_;
 }
 
 void KllSketch::compact_level(std::size_t level) {

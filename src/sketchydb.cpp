@@ -1,10 +1,12 @@
 #include "sketchydb.h"
 
 #include "duckdb_backend.hpp"
+#include "frequency_sketch.hpp"
 #include "hyperloglog.hpp"
 #include "kll_sketch.hpp"
 #include "planner.hpp"
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -25,12 +27,15 @@ namespace {
 constexpr const char* kVersion = "0.1.0";
 constexpr std::uint64_t kPartitionTargetRows = 65536;
 constexpr char kSketchMagic[] = "SKDBHLL2";
+constexpr char kKllSketchMagic[] = "SKDBKLL1";
+constexpr char kFrequencySketchMagic[] = "SKDBFRQ1";
 constexpr double kDefaultStreamingEpsilon = 0.05;
 constexpr double kDefaultStreamingConfidence = 0.90;
 constexpr std::uint8_t kMaxHllPrecision = 24;
 
 struct HllCacheEntry;
 struct KllCacheEntry;
+struct FrequencyCacheEntry;
 
 struct HllCallbackState {
     HllCacheEntry* entry = nullptr;
@@ -40,9 +45,15 @@ struct KllCallbackState {
     KllCacheEntry* entry = nullptr;
 };
 
+struct FrequencyCallbackState {
+    FrequencyCacheEntry* entry = nullptr;
+};
+
 enum class ApproxImplementation {
     HllCountDistinct,
     KllQuantile,
+    Frequency,
+    TopK,
     Unknown,
 };
 
@@ -96,6 +107,83 @@ struct KllCacheEntry {
           source_table(std::move(table)),
           source_column(std::move(column)),
           sketch(capacity, seed) {}
+
+    KllCacheEntry(
+        double epsilon,
+        double confidence,
+        std::uint32_t capacity,
+        std::uint64_t seed,
+        std::string table,
+        std::string column,
+        std::uint64_t count,
+        std::vector<std::vector<double>> levels)
+        : epsilon(epsilon),
+          confidence(confidence),
+          capacity(capacity),
+          seed(seed),
+          source_table(std::move(table)),
+          source_column(std::move(column)),
+          sketch(capacity, seed, count, std::move(levels)) {}
+};
+
+struct FrequencyCacheEntry {
+    double epsilon = 0.0;
+    double confidence = 1.0;
+    std::uint32_t width = 0;
+    std::uint32_t depth = 0;
+    std::uint32_t top_capacity = 0;
+    std::uint64_t seed = 0;
+    std::string input_sql;
+    std::string source_table;
+    std::string source_column;
+    sketchydb::CountMinSketch count_min;
+    sketchydb::SpaceSavingTopK top_k;
+
+    FrequencyCacheEntry(
+        double epsilon,
+        double confidence,
+        std::uint32_t width,
+        std::uint32_t depth,
+        std::uint32_t top_capacity,
+        std::uint64_t seed,
+        std::string input_sql,
+        std::string table,
+        std::string column)
+        : epsilon(epsilon),
+          confidence(confidence),
+          width(width),
+          depth(depth),
+          top_capacity(top_capacity),
+          seed(seed),
+          input_sql(std::move(input_sql)),
+          source_table(std::move(table)),
+          source_column(std::move(column)),
+          count_min(width, depth, seed),
+          top_k(top_capacity) {}
+
+    FrequencyCacheEntry(
+        double epsilon,
+        double confidence,
+        std::uint32_t width,
+        std::uint32_t depth,
+        std::uint32_t top_capacity,
+        std::uint64_t seed,
+        std::string input_sql,
+        std::string table,
+        std::string column,
+        std::vector<std::uint64_t> counters,
+        std::vector<sketchydb::TopKItem> items)
+        : epsilon(epsilon),
+          confidence(confidence),
+          width(width),
+          depth(depth),
+          top_capacity(top_capacity),
+          seed(seed),
+          input_sql(std::move(input_sql)),
+          source_table(std::move(table)),
+          source_column(std::move(column)),
+          count_min(width, depth, seed, std::move(counters)),
+          top_k(top_capacity, std::move(items)) {}
 };
 
 }  // namespace
@@ -107,6 +195,7 @@ struct skdb {
     std::unique_ptr<sketchydb::DuckDBBackend> exact_backend;
     std::unordered_map<std::string, HllCacheEntry> hll_cache;
     std::unordered_map<std::string, KllCacheEntry> kll_cache;
+    std::unordered_map<std::string, FrequencyCacheEntry> frequency_cache;
     std::uint64_t hash_seed = 0;
 };
 
@@ -176,6 +265,20 @@ int collect_kll_value(void* user_data, int column_count, char** column_values, c
     return 0;
 }
 
+int collect_frequency_value(void* user_data, int column_count, char** column_values, char** column_names) {
+    (void)column_names;
+
+    auto* state = static_cast<FrequencyCallbackState*>(user_data);
+    if (state == nullptr || state->entry == nullptr || column_count < 1) {
+        return 1;
+    }
+    if (column_values[0] != nullptr) {
+        state->entry->count_min.add(column_values[0]);
+        state->entry->top_k.add(column_values[0]);
+    }
+    return 0;
+}
+
 int emit_single_value(skdb_callback callback, void* user_data, std::string value, const char* column_name) {
     if (callback == nullptr) {
         return SKDB_OK;
@@ -186,6 +289,31 @@ int emit_single_value(skdb_callback callback, void* user_data, std::string value
     return callback(user_data, 1, values, names) == 0 ? SKDB_OK : SKDB_ERROR;
 }
 
+int emit_top_k(skdb_callback callback, void* user_data, const std::vector<sketchydb::TopKItem>& items) {
+    if (callback == nullptr) {
+        return SKDB_OK;
+    }
+
+    char* names[] = {
+        const_cast<char*>("value"),
+        const_cast<char*>("estimate"),
+        const_cast<char*>("error"),
+    };
+    for (const auto& item : items) {
+        std::string estimate = std::to_string(item.estimate);
+        std::string error = std::to_string(item.error);
+        char* values[] = {
+            const_cast<char*>(item.value.c_str()),
+            estimate.data(),
+            error.data(),
+        };
+        if (callback(user_data, 3, values, names) != 0) {
+            return SKDB_ERROR;
+        }
+    }
+    return SKDB_OK;
+}
+
 ApproxImplementation classify_approx_function(const std::string& function_name) {
     if (function_name == "approx_count_distinct") {
         return ApproxImplementation::HllCountDistinct;
@@ -194,6 +322,12 @@ ApproxImplementation classify_approx_function(const std::string& function_name) 
         function_name == "approx_median" ||
         function_name == "approx_75") {
         return ApproxImplementation::KllQuantile;
+    }
+    if (function_name == "approx_freq") {
+        return ApproxImplementation::Frequency;
+    }
+    if (function_name == "approx_top_k") {
+        return ApproxImplementation::TopK;
     }
     return ApproxImplementation::Unknown;
 }
@@ -257,6 +391,21 @@ std::string kll_input_sql(std::string_view table, std::string_view column) {
     return "select " + std::string(column) + " as skdb_kll_value from " + std::string(table);
 }
 
+std::uint32_t compute_top_capacity(std::uint64_t requested_k, double epsilon) {
+    const auto by_error = static_cast<std::uint64_t>(std::ceil(1.0 / epsilon));
+    const auto capacity = std::max<std::uint64_t>(requested_k, by_error);
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, 1U << 20U));
+}
+
+std::string frequency_cache_key(
+    std::string_view input_sql,
+    std::uint32_t width,
+    std::uint32_t depth,
+    std::uint32_t top_capacity) {
+    return "freq|" + std::string(input_sql) + "|" + std::to_string(width) + "|" +
+           std::to_string(depth) + "|" + std::to_string(top_capacity);
+}
+
 std::uint64_t stable_hash(std::string_view value) {
     std::uint64_t hash = 14695981039346656037ULL;
     for (unsigned char byte : value) {
@@ -286,6 +435,14 @@ std::filesystem::path hash_seed_path(const skdb* db) {
 
 std::filesystem::path sketch_path(const skdb* db, const std::string& cache_key) {
     return sketch_root(db) / (hex_hash(cache_key) + ".hll");
+}
+
+std::filesystem::path kll_sketch_path(const skdb* db, const std::string& cache_key) {
+    return sketch_root(db) / (hex_hash(cache_key) + ".kll");
+}
+
+std::filesystem::path frequency_sketch_path(const skdb* db, const std::string& cache_key) {
+    return sketch_root(db) / (hex_hash(cache_key) + ".freq");
 }
 
 void save_hash_seed(const skdb* db) {
@@ -333,6 +490,12 @@ double estimate_partitioned_hll(const HllCacheEntry& entry) {
         merged.merge(entry.partitions[index]);
     }
     return merged.estimate();
+}
+
+void write_string(std::ofstream& output, const std::string& value) {
+    const std::uint64_t size = value.size();
+    output.write(reinterpret_cast<const char*>(&size), sizeof(size));
+    output.write(value.data(), static_cast<std::streamsize>(value.size()));
 }
 
 void save_hll_entry(const skdb* db, const std::string& cache_key, const HllCacheEntry& entry) {
@@ -430,6 +593,226 @@ bool load_hll_entry(const skdb* db, const std::string& cache_key, HllCacheEntry&
     return true;
 }
 
+void save_kll_entry(const skdb* db, const std::string& cache_key, const KllCacheEntry& entry) {
+    if (!persistence_enabled(db)) {
+        return;
+    }
+
+    std::filesystem::create_directories(sketch_root(db));
+    std::ofstream output(kll_sketch_path(db, cache_key), std::ios::binary | std::ios::trunc);
+    if (!output) {
+        return;
+    }
+
+    const auto& levels = entry.sketch.levels();
+    const std::uint64_t level_count = levels.size();
+    output.write(kKllSketchMagic, sizeof(kKllSketchMagic));
+    output.write(reinterpret_cast<const char*>(&entry.epsilon), sizeof(entry.epsilon));
+    output.write(reinterpret_cast<const char*>(&entry.confidence), sizeof(entry.confidence));
+    output.write(reinterpret_cast<const char*>(&entry.capacity), sizeof(entry.capacity));
+    output.write(reinterpret_cast<const char*>(&entry.seed), sizeof(entry.seed));
+    const auto count = entry.sketch.count();
+    output.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    write_string(output, entry.source_table);
+    write_string(output, entry.source_column);
+    output.write(reinterpret_cast<const char*>(&level_count), sizeof(level_count));
+    for (const auto& level : levels) {
+        const std::uint64_t level_size = level.size();
+        output.write(reinterpret_cast<const char*>(&level_size), sizeof(level_size));
+        output.write(
+            reinterpret_cast<const char*>(level.data()),
+            static_cast<std::streamsize>(level.size() * sizeof(double)));
+    }
+}
+
+bool load_kll_entry(const skdb* db, const std::string& cache_key, KllCacheEntry& entry) {
+    if (!persistence_enabled(db)) {
+        return false;
+    }
+
+    std::ifstream input(kll_sketch_path(db, cache_key), std::ios::binary);
+    if (!input) {
+        return false;
+    }
+
+    char magic[sizeof(kKllSketchMagic)] = {};
+    input.read(magic, sizeof(magic));
+    if (std::memcmp(magic, kKllSketchMagic, sizeof(kKllSketchMagic)) != 0) {
+        return false;
+    }
+
+    double epsilon = 0.0;
+    double confidence = 1.0;
+    std::uint32_t capacity = 0;
+    std::uint64_t seed = 0;
+    std::uint64_t count = 0;
+    std::string source_table;
+    std::string source_column;
+    std::uint64_t level_count = 0;
+    input.read(reinterpret_cast<char*>(&epsilon), sizeof(epsilon));
+    input.read(reinterpret_cast<char*>(&confidence), sizeof(confidence));
+    input.read(reinterpret_cast<char*>(&capacity), sizeof(capacity));
+    input.read(reinterpret_cast<char*>(&seed), sizeof(seed));
+    input.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!read_string(input, source_table) || !read_string(input, source_column)) {
+        return false;
+    }
+    input.read(reinterpret_cast<char*>(&level_count), sizeof(level_count));
+    if (!input || level_count == 0 || level_count > 128) {
+        return false;
+    }
+
+    std::vector<std::vector<double>> levels;
+    levels.reserve(static_cast<std::size_t>(level_count));
+    for (std::uint64_t index = 0; index < level_count; ++index) {
+        std::uint64_t level_size = 0;
+        input.read(reinterpret_cast<char*>(&level_size), sizeof(level_size));
+        if (!input || level_size > 10000000) {
+            return false;
+        }
+        std::vector<double> level(static_cast<std::size_t>(level_size));
+        input.read(
+            reinterpret_cast<char*>(level.data()),
+            static_cast<std::streamsize>(level.size() * sizeof(double)));
+        if (!input) {
+            return false;
+        }
+        levels.push_back(std::move(level));
+    }
+
+    entry = KllCacheEntry(
+        epsilon,
+        confidence,
+        capacity,
+        seed,
+        std::move(source_table),
+        std::move(source_column),
+        count,
+        std::move(levels));
+    return true;
+}
+
+void save_frequency_entry(const skdb* db, const std::string& cache_key, const FrequencyCacheEntry& entry) {
+    if (!persistence_enabled(db)) {
+        return;
+    }
+
+    std::filesystem::create_directories(sketch_root(db));
+    std::ofstream output(frequency_sketch_path(db, cache_key), std::ios::binary | std::ios::trunc);
+    if (!output) {
+        return;
+    }
+
+    const auto& counters = entry.count_min.counters();
+    const auto top_items = entry.top_k.top_k(entry.top_capacity);
+    const std::uint64_t counter_count = counters.size();
+    const std::uint64_t item_count = top_items.size();
+    output.write(kFrequencySketchMagic, sizeof(kFrequencySketchMagic));
+    output.write(reinterpret_cast<const char*>(&entry.epsilon), sizeof(entry.epsilon));
+    output.write(reinterpret_cast<const char*>(&entry.confidence), sizeof(entry.confidence));
+    output.write(reinterpret_cast<const char*>(&entry.width), sizeof(entry.width));
+    output.write(reinterpret_cast<const char*>(&entry.depth), sizeof(entry.depth));
+    output.write(reinterpret_cast<const char*>(&entry.top_capacity), sizeof(entry.top_capacity));
+    output.write(reinterpret_cast<const char*>(&entry.seed), sizeof(entry.seed));
+    write_string(output, entry.input_sql);
+    write_string(output, entry.source_table);
+    write_string(output, entry.source_column);
+    output.write(reinterpret_cast<const char*>(&counter_count), sizeof(counter_count));
+    output.write(
+        reinterpret_cast<const char*>(counters.data()),
+        static_cast<std::streamsize>(counters.size() * sizeof(std::uint64_t)));
+    output.write(reinterpret_cast<const char*>(&item_count), sizeof(item_count));
+    for (const auto& item : top_items) {
+        write_string(output, item.value);
+        output.write(reinterpret_cast<const char*>(&item.estimate), sizeof(item.estimate));
+        output.write(reinterpret_cast<const char*>(&item.error), sizeof(item.error));
+    }
+}
+
+bool load_frequency_entry(const skdb* db, const std::string& cache_key, FrequencyCacheEntry& entry) {
+    if (!persistence_enabled(db)) {
+        return false;
+    }
+
+    std::ifstream input(frequency_sketch_path(db, cache_key), std::ios::binary);
+    if (!input) {
+        return false;
+    }
+
+    char magic[sizeof(kFrequencySketchMagic)] = {};
+    input.read(magic, sizeof(magic));
+    if (std::memcmp(magic, kFrequencySketchMagic, sizeof(kFrequencySketchMagic)) != 0) {
+        return false;
+    }
+
+    double epsilon = 0.0;
+    double confidence = 1.0;
+    std::uint32_t width = 0;
+    std::uint32_t depth = 0;
+    std::uint32_t top_capacity = 0;
+    std::uint64_t seed = 0;
+    std::string input_sql;
+    std::string source_table;
+    std::string source_column;
+    std::uint64_t counter_count = 0;
+    input.read(reinterpret_cast<char*>(&epsilon), sizeof(epsilon));
+    input.read(reinterpret_cast<char*>(&confidence), sizeof(confidence));
+    input.read(reinterpret_cast<char*>(&width), sizeof(width));
+    input.read(reinterpret_cast<char*>(&depth), sizeof(depth));
+    input.read(reinterpret_cast<char*>(&top_capacity), sizeof(top_capacity));
+    input.read(reinterpret_cast<char*>(&seed), sizeof(seed));
+    if (!read_string(input, input_sql) ||
+        !read_string(input, source_table) ||
+        !read_string(input, source_column)) {
+        return false;
+    }
+    input.read(reinterpret_cast<char*>(&counter_count), sizeof(counter_count));
+    if (!input || counter_count == 0 || counter_count > 100000000) {
+        return false;
+    }
+    std::vector<std::uint64_t> counters(static_cast<std::size_t>(counter_count));
+    input.read(
+        reinterpret_cast<char*>(counters.data()),
+        static_cast<std::streamsize>(counters.size() * sizeof(std::uint64_t)));
+    if (!input) {
+        return false;
+    }
+
+    std::uint64_t item_count = 0;
+    input.read(reinterpret_cast<char*>(&item_count), sizeof(item_count));
+    if (!input || item_count > 1000000) {
+        return false;
+    }
+    std::vector<sketchydb::TopKItem> items;
+    items.reserve(static_cast<std::size_t>(item_count));
+    for (std::uint64_t index = 0; index < item_count; ++index) {
+        sketchydb::TopKItem item;
+        if (!read_string(input, item.value)) {
+            return false;
+        }
+        input.read(reinterpret_cast<char*>(&item.estimate), sizeof(item.estimate));
+        input.read(reinterpret_cast<char*>(&item.error), sizeof(item.error));
+        if (!input) {
+            return false;
+        }
+        items.push_back(std::move(item));
+    }
+
+    entry = FrequencyCacheEntry(
+        epsilon,
+        confidence,
+        width,
+        depth,
+        top_capacity,
+        seed,
+        std::move(input_sql),
+        std::move(source_table),
+        std::move(source_column),
+        std::move(counters),
+        std::move(items));
+    return true;
+}
+
 void invalidate_persisted_sketches(skdb* db) {
     if (persistence_enabled(db)) {
         const auto seed = db->hash_seed;
@@ -490,22 +873,39 @@ bool add_inserted_values_to_hll_cache(skdb* db, const sketchydb::Plan& plan) {
     return handled_any;
 }
 
+bool find_insert_column_index(const sketchydb::Plan& plan, const std::string& column, std::size_t& column_index) {
+    for (std::size_t index = 0; index < plan.insert_columns.size(); ++index) {
+        if (plan.insert_columns[index] == column) {
+            column_index = index;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool prewarm_streaming_hll_cache(skdb* db, const sketchydb::Plan& plan) {
     if (plan.mutation_kind != sketchydb::MutationKind::InsertValues || plan.insert_columns.empty()) {
         return false;
     }
 
     bool prewarmed_any = false;
-    for (std::size_t column_index = 0; column_index < plan.insert_columns.size(); ++column_index) {
-        const auto& column = plan.insert_columns[column_index];
+    const auto& prewarm_columns = plan.has_approx_hint ? plan.approx_hint_columns : plan.insert_columns;
+    const double epsilon = plan.has_approx_hint ? plan.approx_hint_epsilon : kDefaultStreamingEpsilon;
+    const double confidence = plan.has_approx_hint ? plan.approx_hint_confidence : kDefaultStreamingConfidence;
+    for (std::size_t prewarm_index = 0; prewarm_index < prewarm_columns.size(); ++prewarm_index) {
+        const auto& column = prewarm_columns[prewarm_index];
         if (column.empty()) {
+            continue;
+        }
+        std::size_t column_index = prewarm_index;
+        if (plan.has_approx_hint && !find_insert_column_index(plan, column, column_index)) {
             continue;
         }
 
         const auto input_sql = hll_input_sql(plan.mutation_table, column);
         const auto default_precision = sketchydb::HyperLogLog::required_precision(
-            kDefaultStreamingEpsilon,
-            kDefaultStreamingConfidence);
+            epsilon,
+            confidence);
         const auto cache_key = hll_cache_key(
             "approx_count_distinct",
             input_sql,
@@ -520,8 +920,8 @@ bool prewarm_streaming_hll_cache(skdb* db, const sketchydb::Plan& plan) {
             std::piecewise_construct,
             std::forward_as_tuple(cache_key),
             std::forward_as_tuple(
-                kDefaultStreamingEpsilon,
-                kDefaultStreamingConfidence,
+                epsilon,
+                confidence,
                 default_precision,
                 db->hash_seed,
                 plan.mutation_table,
@@ -608,13 +1008,20 @@ bool prewarm_streaming_kll_cache(skdb* db, const sketchydb::Plan& plan) {
     }
 
     bool prewarmed_any = false;
+    const auto& prewarm_columns = plan.has_approx_hint ? plan.approx_hint_columns : plan.insert_columns;
+    const double epsilon = plan.has_approx_hint ? plan.approx_hint_epsilon : kDefaultStreamingEpsilon;
+    const double confidence = plan.has_approx_hint ? plan.approx_hint_confidence : kDefaultStreamingConfidence;
     const auto default_capacity = sketchydb::KllSketch::required_capacity(
-        kDefaultStreamingEpsilon,
-        kDefaultStreamingConfidence);
+        epsilon,
+        confidence);
 
-    for (std::size_t column_index = 0; column_index < plan.insert_columns.size(); ++column_index) {
-        const auto& column = plan.insert_columns[column_index];
+    for (std::size_t prewarm_index = 0; prewarm_index < prewarm_columns.size(); ++prewarm_index) {
+        const auto& column = prewarm_columns[prewarm_index];
         if (column.empty()) {
+            continue;
+        }
+        std::size_t column_index = prewarm_index;
+        if (plan.has_approx_hint && !find_insert_column_index(plan, column, column_index)) {
             continue;
         }
 
@@ -628,8 +1035,8 @@ bool prewarm_streaming_kll_cache(skdb* db, const sketchydb::Plan& plan) {
             std::piecewise_construct,
             std::forward_as_tuple(cache_key),
             std::forward_as_tuple(
-                kDefaultStreamingEpsilon,
-                kDefaultStreamingConfidence,
+                epsilon,
+                confidence,
                 default_capacity,
                 db->hash_seed,
                 plan.mutation_table,
@@ -648,6 +1055,118 @@ bool prewarm_streaming_kll_cache(skdb* db, const sketchydb::Plan& plan) {
             prewarmed_any = true;
         } else {
             db->kll_cache.erase(inserted.first);
+        }
+    }
+
+    return prewarmed_any;
+}
+
+void add_value_to_frequency_entry(FrequencyCacheEntry& entry, std::string_view value) {
+    entry.count_min.add(value);
+    entry.top_k.add(value);
+}
+
+bool add_inserted_values_to_frequency_cache(skdb* db, const sketchydb::Plan& plan) {
+    if (plan.mutation_kind != sketchydb::MutationKind::InsertValues) {
+        return false;
+    }
+
+    bool handled_any = false;
+    for (auto& [key, entry] : db->frequency_cache) {
+        (void)key;
+        if (entry.source_table != plan.mutation_table || entry.source_column.empty()) {
+            continue;
+        }
+
+        std::size_t column_index = 0;
+        if (!plan.insert_columns.empty()) {
+            bool found = false;
+            for (std::size_t index = 0; index < plan.insert_columns.size(); ++index) {
+                if (plan.insert_columns[index] == entry.source_column) {
+                    column_index = index;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                continue;
+            }
+        } else {
+            for (const auto& row : plan.insert_rows) {
+                if (row.size() != 1) {
+                    return false;
+                }
+            }
+            column_index = 0;
+        }
+
+        for (const auto& row : plan.insert_rows) {
+            if (column_index >= row.size() || row[column_index].empty()) {
+                return false;
+            }
+            add_value_to_frequency_entry(entry, row[column_index]);
+        }
+        handled_any = true;
+    }
+
+    return handled_any;
+}
+
+bool prewarm_streaming_frequency_cache(skdb* db, const sketchydb::Plan& plan) {
+    if (plan.mutation_kind != sketchydb::MutationKind::InsertValues || plan.insert_columns.empty()) {
+        return false;
+    }
+
+    bool prewarmed_any = false;
+    const auto& prewarm_columns = plan.has_approx_hint ? plan.approx_hint_columns : plan.insert_columns;
+    const double epsilon = plan.has_approx_hint ? plan.approx_hint_epsilon : kDefaultStreamingEpsilon;
+    const double confidence = plan.has_approx_hint ? plan.approx_hint_confidence : kDefaultStreamingConfidence;
+    const auto default_width = sketchydb::CountMinSketch::required_width(epsilon);
+    const auto default_depth = sketchydb::CountMinSketch::required_depth(confidence);
+    const auto default_top_capacity = compute_top_capacity(10, epsilon);
+
+    for (std::size_t prewarm_index = 0; prewarm_index < prewarm_columns.size(); ++prewarm_index) {
+        const auto& column = prewarm_columns[prewarm_index];
+        if (column.empty()) {
+            continue;
+        }
+        std::size_t column_index = prewarm_index;
+        if (plan.has_approx_hint && !find_insert_column_index(plan, column, column_index)) {
+            continue;
+        }
+
+        const auto input_sql = hll_input_sql(plan.mutation_table, column);
+        const auto cache_key = frequency_cache_key(input_sql, default_width, default_depth, default_top_capacity);
+        if (db->frequency_cache.find(cache_key) != db->frequency_cache.end()) {
+            continue;
+        }
+
+        auto inserted = db->frequency_cache.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(cache_key),
+            std::forward_as_tuple(
+                epsilon,
+                confidence,
+                default_width,
+                default_depth,
+                default_top_capacity,
+                db->hash_seed,
+                input_sql,
+                plan.mutation_table,
+                column));
+
+        bool saw_value = false;
+        for (const auto& row : plan.insert_rows) {
+            if (column_index < row.size() && !row[column_index].empty()) {
+                add_value_to_frequency_entry(inserted.first->second, row[column_index]);
+                saw_value = true;
+            }
+        }
+
+        if (saw_value) {
+            prewarmed_any = true;
+        } else {
+            db->frequency_cache.erase(inserted.first);
         }
     }
 
@@ -720,8 +1239,94 @@ std::pair<std::string, KllCacheEntry*> find_sufficient_kll_cache(
     return best;
 }
 
+std::pair<std::string, KllCacheEntry*> load_sufficient_kll_cache(
+    skdb* db,
+    const sketchydb::Plan& plan,
+    std::uint32_t required_capacity) {
+    const auto key = kll_cache_key(plan.input_sql, required_capacity);
+    auto inserted = db->kll_cache.emplace(
+        std::piecewise_construct,
+        std::forward_as_tuple(key),
+        std::forward_as_tuple(
+            plan.epsilon,
+            plan.confidence,
+            required_capacity,
+            db->hash_seed,
+            plan.source_table,
+            plan.source_column));
+    if (load_kll_entry(db, key, inserted.first->second) &&
+        inserted.first->second.seed == db->hash_seed &&
+        inserted.first->second.capacity >= required_capacity) {
+        return {key, &inserted.first->second};
+    }
+    db->kll_cache.erase(inserted.first);
+    return {"", nullptr};
+}
+
 std::string kll_cache_key_for_capacity(const sketchydb::Plan& plan, std::uint32_t capacity) {
     return kll_cache_key(plan.input_sql, capacity);
+}
+
+std::pair<std::string, FrequencyCacheEntry*> find_sufficient_frequency_cache(
+    skdb* db,
+    const sketchydb::Plan& plan,
+    std::uint32_t required_width,
+    std::uint32_t required_depth,
+    std::uint32_t required_top_capacity) {
+    std::pair<std::string, FrequencyCacheEntry*> best{"", nullptr};
+    for (auto& [key, entry] : db->frequency_cache) {
+        if (entry.input_sql == plan.input_sql &&
+            entry.seed == db->hash_seed &&
+            entry.width >= required_width &&
+            entry.depth >= required_depth &&
+            entry.top_capacity >= required_top_capacity) {
+            if (best.second == nullptr ||
+                (entry.width * entry.depth + entry.top_capacity) <
+                    (best.second->width * best.second->depth + best.second->top_capacity)) {
+                best = {key, &entry};
+            }
+        }
+    }
+    return best;
+}
+
+std::string frequency_cache_key_for_requirements(
+    const sketchydb::Plan& plan,
+    std::uint32_t width,
+    std::uint32_t depth,
+    std::uint32_t top_capacity) {
+    return frequency_cache_key(plan.input_sql, width, depth, top_capacity);
+}
+
+std::pair<std::string, FrequencyCacheEntry*> load_sufficient_frequency_cache(
+    skdb* db,
+    const sketchydb::Plan& plan,
+    std::uint32_t required_width,
+    std::uint32_t required_depth,
+    std::uint32_t required_top_capacity) {
+    const auto key = frequency_cache_key_for_requirements(plan, required_width, required_depth, required_top_capacity);
+    auto inserted = db->frequency_cache.emplace(
+        std::piecewise_construct,
+        std::forward_as_tuple(key),
+        std::forward_as_tuple(
+            plan.epsilon,
+            plan.confidence,
+            required_width,
+            required_depth,
+            required_top_capacity,
+            db->hash_seed,
+            plan.input_sql,
+            plan.source_table,
+            plan.source_column));
+    if (load_frequency_entry(db, key, inserted.first->second) &&
+        inserted.first->second.seed == db->hash_seed &&
+        inserted.first->second.width >= required_width &&
+        inserted.first->second.depth >= required_depth &&
+        inserted.first->second.top_capacity >= required_top_capacity) {
+        return {key, &inserted.first->second};
+    }
+    db->frequency_cache.erase(inserted.first);
+    return {"", nullptr};
 }
 
 std::uint64_t hll_cache_entry_memory_bytes(const HllCacheEntry& entry) {
@@ -742,6 +1347,16 @@ std::uint64_t kll_cache_entry_memory_bytes(const KllCacheEntry& entry) {
     bytes += static_cast<std::uint64_t>(entry.source_table.capacity());
     bytes += static_cast<std::uint64_t>(entry.source_column.capacity());
     bytes += entry.sketch.memory_bytes();
+    return bytes;
+}
+
+std::uint64_t frequency_cache_entry_memory_bytes(const FrequencyCacheEntry& entry) {
+    auto bytes = static_cast<std::uint64_t>(sizeof(FrequencyCacheEntry));
+    bytes += static_cast<std::uint64_t>(entry.input_sql.capacity());
+    bytes += static_cast<std::uint64_t>(entry.source_table.capacity());
+    bytes += static_cast<std::uint64_t>(entry.source_column.capacity());
+    bytes += entry.count_min.memory_bytes();
+    bytes += entry.top_k.memory_bytes();
     return bytes;
 }
 
@@ -804,10 +1419,90 @@ int skdb_exec(
                 error_message,
                 plan.approximate_function + " is not a supported SketchyDB approximate function yet");
         }
+        if (implementation == ApproxImplementation::Frequency ||
+            implementation == ApproxImplementation::TopK) {
+            const auto required_width = sketchydb::CountMinSketch::required_width(plan.epsilon);
+            const auto required_depth = sketchydb::CountMinSketch::required_depth(plan.confidence);
+            const auto required_top_capacity = implementation == ApproxImplementation::TopK
+                                                   ? compute_top_capacity(plan.top_k, plan.epsilon)
+                                                   : 0;
+            auto [cache_key, cached] = find_sufficient_frequency_cache(
+                db,
+                plan,
+                required_width,
+                required_depth,
+                required_top_capacity);
+            if (cached == nullptr) {
+                auto loaded = load_sufficient_frequency_cache(
+                    db,
+                    plan,
+                    required_width,
+                    required_depth,
+                    required_top_capacity);
+                cache_key = std::move(loaded.first);
+                cached = loaded.second;
+            }
+            if (cached == nullptr) {
+                cache_key = frequency_cache_key_for_requirements(
+                    plan,
+                    required_width,
+                    required_depth,
+                    required_top_capacity);
+                auto inserted = db->frequency_cache.emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(cache_key),
+                    std::forward_as_tuple(
+                        plan.epsilon,
+                        plan.confidence,
+                        required_width,
+                        required_depth,
+                        required_top_capacity,
+                        db->hash_seed,
+                        plan.input_sql,
+                        plan.source_table,
+                        plan.source_column));
+                cached = &inserted.first->second;
+
+                FrequencyCallbackState state{.entry = cached};
+                std::string error;
+                int rc = db->exact_backend->exec(
+                    plan.input_sql.c_str(),
+                    collect_frequency_value,
+                    &state,
+                    error);
+                if (rc != SKDB_OK) {
+                    db->frequency_cache.erase(cache_key);
+                    return set_error(db, error_message, error);
+                }
+                save_frequency_entry(db, cache_key, *cached);
+            }
+
+            int rc = SKDB_OK;
+            if (implementation == ApproxImplementation::Frequency) {
+                rc = emit_single_value(
+                    callback,
+                    user_data,
+                    std::to_string(cached->count_min.estimate(plan.target_value)),
+                    "approx_freq");
+            } else {
+                rc = emit_top_k(callback, user_data, cached->top_k.top_k(static_cast<std::uint32_t>(plan.top_k)));
+            }
+            if (rc != SKDB_OK) {
+                return set_error(db, error_message, "query aborted by callback");
+            }
+
+            db->last_error.clear();
+            return SKDB_OK;
+        }
         if (implementation == ApproxImplementation::KllQuantile) {
             const auto required_capacity =
                 sketchydb::KllSketch::required_capacity(plan.epsilon, plan.confidence);
             auto [cache_key, cached] = find_sufficient_kll_cache(db, plan, required_capacity);
+            if (cached == nullptr) {
+                auto loaded = load_sufficient_kll_cache(db, plan, required_capacity);
+                cache_key = std::move(loaded.first);
+                cached = loaded.second;
+            }
             if (cached == nullptr) {
                 cache_key = kll_cache_key_for_capacity(plan, required_capacity);
                 auto inserted = db->kll_cache.emplace(
@@ -833,6 +1528,7 @@ int skdb_exec(
                     db->kll_cache.erase(cache_key);
                     return set_error(db, error_message, error);
                 }
+                save_kll_entry(db, cache_key, *cached);
             }
 
             int rc = emit_single_value(
@@ -898,7 +1594,9 @@ int skdb_exec(
     }
 
     std::string error;
-    int rc = db->exact_backend->exec(sql, callback, user_data, error);
+    const std::string& sql_to_execute = plan.sql_to_execute.empty() ? std::string() : plan.sql_to_execute;
+    const char* exact_sql = plan.sql_to_execute.empty() ? sql : sql_to_execute.c_str();
+    int rc = db->exact_backend->exec(exact_sql, callback, user_data, error);
     if (rc != SKDB_OK) {
         return set_error(db, error_message, error);
     }
@@ -907,10 +1605,20 @@ int skdb_exec(
         const bool prewarmed = prewarm_streaming_hll_cache(db, plan);
         const bool updated_existing_kll = add_inserted_values_to_kll_cache(db, plan);
         const bool prewarmed_kll = prewarm_streaming_kll_cache(db, plan);
+        const bool updated_existing_frequency = add_inserted_values_to_frequency_cache(db, plan);
+        const bool prewarmed_frequency = prewarm_streaming_frequency_cache(db, plan);
         for (const auto& [cache_key, entry] : db->hll_cache) {
             save_hll_entry(db, cache_key, entry);
         }
-        if (updated_existing || prewarmed || updated_existing_kll || prewarmed_kll) {
+        for (const auto& [cache_key, entry] : db->kll_cache) {
+            save_kll_entry(db, cache_key, entry);
+        }
+        for (const auto& [cache_key, entry] : db->frequency_cache) {
+            save_frequency_entry(db, cache_key, entry);
+        }
+        if (updated_existing || prewarmed ||
+            updated_existing_kll || prewarmed_kll ||
+            updated_existing_frequency || prewarmed_frequency) {
             db->last_error.clear();
             return SKDB_OK;
         }
@@ -918,6 +1626,7 @@ int skdb_exec(
     if (plan.invalidates_sketches) {
         db->hll_cache.clear();
         db->kll_cache.clear();
+        db->frequency_cache.clear();
         invalidate_persisted_sketches(db);
     }
 
@@ -951,6 +1660,12 @@ std::uint64_t skdb_approx_memory_bytes(skdb* db) {
         bytes += static_cast<std::uint64_t>(sizeof(void*) * 2);
         bytes += static_cast<std::uint64_t>(sizeof(std::string) + cache_key.capacity());
         bytes += kll_cache_entry_memory_bytes(entry);
+    }
+    bytes += static_cast<std::uint64_t>(db->frequency_cache.bucket_count() * sizeof(void*));
+    for (const auto& [cache_key, entry] : db->frequency_cache) {
+        bytes += static_cast<std::uint64_t>(sizeof(void*) * 2);
+        bytes += static_cast<std::uint64_t>(sizeof(std::string) + cache_key.capacity());
+        bytes += frequency_cache_entry_memory_bytes(entry);
     }
 
     return bytes;

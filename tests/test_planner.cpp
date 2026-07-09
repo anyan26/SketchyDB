@@ -26,13 +26,17 @@ void assert_approx_count_distinct(std::string sql) {
     assert_approx_function(sql, "approx_count_distinct");
 }
 
-void assert_invalid_approx(std::string sql, std::string expected_error) {
+void assert_invalid_approx(std::string sql, std::string expected_function, std::string expected_error) {
     sketchydb::Planner planner;
     auto plan = planner.plan(sql);
 
     assert(plan.mode == sketchydb::ExecutionMode::Approximate);
-    assert(plan.approximate_function == "approx_count_distinct");
+    assert(plan.approximate_function == expected_function);
     assert(plan.error_message == expected_error);
+}
+
+void assert_invalid_approx(std::string sql, std::string expected_error) {
+    assert_invalid_approx(sql, "approx_count_distinct", expected_error);
 }
 
 void recognizes_function_style_approximate_query() {
@@ -50,6 +54,11 @@ void recognizes_quantile_functions() {
     assert_approx_function("select approx_75(latency_ms, 0.01, 0.99) from events", "approx_75");
 }
 
+void recognizes_frequency_functions() {
+    assert_approx_function("select approx_freq(user_id, 'user-123', 0.01, 0.99) from events", "approx_freq");
+    assert_approx_function("select approx_top_k(user_id, 10, 0.01, 0.99) from events", "approx_top_k");
+}
+
 void allows_whitespace_before_function_arguments() {
     assert_approx_count_distinct("select approx_count_distinct   (user_id, 0.01, 0.99) from events");
 }
@@ -65,6 +74,27 @@ void captures_epsilon_and_confidence() {
     assert(plan.source_column == "user_id");
     assert(plan.epsilon == 0.05);
     assert(plan.confidence == 0.95);
+}
+
+void captures_frequency_target_and_top_k() {
+    sketchydb::Planner planner;
+    auto freq_plan = planner.plan("select approx_freq(user_id, 'user-7', 0.05, 0.95) from events");
+
+    assert(freq_plan.mode == sketchydb::ExecutionMode::Approximate);
+    assert(freq_plan.approximate_function == "approx_freq");
+    assert(freq_plan.input_sql == "select user_id as skdb_hll_value from events");
+    assert(freq_plan.source_table == "events");
+    assert(freq_plan.source_column == "user_id");
+    assert(freq_plan.target_value == "user-7");
+    assert(freq_plan.epsilon == 0.05);
+    assert(freq_plan.confidence == 0.95);
+
+    auto topk_plan = planner.plan("select approx_top_k(user_id, 10, 0.05, 0.95) from events");
+    assert(topk_plan.mode == sketchydb::ExecutionMode::Approximate);
+    assert(topk_plan.approximate_function == "approx_top_k");
+    assert(topk_plan.top_k == 10);
+    assert(topk_plan.epsilon == 0.05);
+    assert(topk_plan.confidence == 0.95);
 }
 
 void rejects_missing_epsilon_and_confidence() {
@@ -104,6 +134,17 @@ void rejects_non_numeric_bounds() {
     assert_invalid_approx(
         "select approx_count_distinct(user_id, 0.01, confidence) from events",
         "approx_count_distinct confidence must be a number in (0, 1]");
+}
+
+void rejects_invalid_frequency_arguments() {
+    assert_invalid_approx(
+        "select approx_freq(user_id, 'a', 0.01) from events",
+        "approx_freq",
+        "approx_freq expects exactly 4 arguments");
+    assert_invalid_approx(
+        "select approx_top_k(user_id, 0, 0.01, 0.99) from events",
+        "approx_top_k",
+        "approx_top_k k must be a positive integer literal");
 }
 
 void exact_query_stays_exact() {
@@ -147,6 +188,25 @@ void insert_column_list_is_parsed() {
     assert(plan.insert_rows.size() == 2);
     assert(plan.insert_rows[0][1] == "user-1");
     assert(plan.insert_rows[1][1] == "user-2");
+}
+
+void insert_approx_hint_is_parsed_and_stripped() {
+    sketchydb::Planner planner;
+
+    auto plan = planner.plan(
+        "insert approx_hint((user_id, latency_ms), 0.01, 0.99) "
+        "into events(user_id, latency_ms) values ('u1', 42)");
+    assert(plan.mode == sketchydb::ExecutionMode::Exact);
+    assert(plan.invalidates_sketches);
+    assert(plan.mutation_kind == sketchydb::MutationKind::InsertValues);
+    assert(plan.mutation_table == "events");
+    assert(plan.has_approx_hint);
+    assert(plan.approx_hint_columns.size() == 2);
+    assert(plan.approx_hint_columns[0] == "user_id");
+    assert(plan.approx_hint_columns[1] == "latency_ms");
+    assert(plan.approx_hint_epsilon == 0.01);
+    assert(plan.approx_hint_confidence == 0.99);
+    assert(plan.sql_to_execute == "insert into events(user_id, latency_ms) values ('u1', 42)");
 }
 
 void mutation_keywords_inside_strings_and_comments_do_not_invalidate() {
@@ -202,16 +262,20 @@ int main() {
     recognizes_function_style_approximate_query();
     recognizes_function_case_insensitively();
     recognizes_quantile_functions();
+    recognizes_frequency_functions();
     allows_whitespace_before_function_arguments();
     captures_epsilon_and_confidence();
+    captures_frequency_target_and_top_k();
     rejects_missing_epsilon_and_confidence();
     rejects_missing_confidence();
     rejects_out_of_range_epsilon();
     rejects_out_of_range_confidence();
     rejects_non_numeric_bounds();
+    rejects_invalid_frequency_arguments();
     exact_query_stays_exact();
     mutation_queries_invalidate_sketches();
     insert_column_list_is_parsed();
+    insert_approx_hint_is_parsed_and_stripped();
     mutation_keywords_inside_strings_and_comments_do_not_invalidate();
     later_statement_mutations_invalidate_sketches();
     identifier_without_call_stays_exact();

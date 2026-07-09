@@ -31,16 +31,16 @@ BUILD_DIR := build/plain
 ifeq ($(SKDB_USE_DUCKDB),1)
 BUILD_DIR := build/duckdb
 endif
-LIB_OBJECTS := $(BUILD_DIR)/sketchydb.o $(BUILD_DIR)/planner.o $(BUILD_DIR)/duckdb_backend.o $(BUILD_DIR)/hyperloglog.o $(BUILD_DIR)/kll_sketch.o
+LIB_OBJECTS := $(BUILD_DIR)/sketchydb.o $(BUILD_DIR)/planner.o $(BUILD_DIR)/duckdb_backend.o $(BUILD_DIR)/hyperloglog.o $(BUILD_DIR)/kll_sketch.o $(BUILD_DIR)/frequency_sketch.o
 
-.PHONY: all clean test perf perf_kll
+.PHONY: all clean test perf perf_kll perf_freq
 
 all: $(BUILD_DIR)/libsketchydb.a $(BUILD_DIR)/sketchydb
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(BUILD_DIR)/sketchydb.o: src/sketchydb.cpp include/sketchydb.h src/kll_sketch.hpp | $(BUILD_DIR)
+$(BUILD_DIR)/sketchydb.o: src/sketchydb.cpp include/sketchydb.h src/kll_sketch.hpp src/frequency_sketch.hpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/planner.o: src/planner.cpp src/planner.hpp | $(BUILD_DIR)
@@ -53,6 +53,9 @@ $(BUILD_DIR)/hyperloglog.o: src/hyperloglog.cpp src/hyperloglog.hpp | $(BUILD_DI
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kll_sketch.o: src/kll_sketch.cpp src/kll_sketch.hpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/frequency_sketch.o: src/frequency_sketch.cpp src/frequency_sketch.hpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/libsketchydb.a: $(LIB_OBJECTS)
@@ -88,11 +91,18 @@ $(BUILD_DIR)/test_kll_sketch.o: tests/test_kll_sketch.cpp src/kll_sketch.hpp | $
 $(BUILD_DIR)/test_kll_sketch: $(BUILD_DIR)/test_kll_sketch.o $(BUILD_DIR)/kll_sketch.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-test: $(BUILD_DIR)/test_smoke $(BUILD_DIR)/test_planner $(BUILD_DIR)/test_hyperloglog $(BUILD_DIR)/test_kll_sketch
+$(BUILD_DIR)/test_frequency_sketch.o: tests/test_frequency_sketch.cpp src/frequency_sketch.hpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) -Isrc $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_frequency_sketch: $(BUILD_DIR)/test_frequency_sketch.o $(BUILD_DIR)/frequency_sketch.o
+	$(CXX) $(CXXFLAGS) $^ -o $@
+
+test: $(BUILD_DIR)/test_smoke $(BUILD_DIR)/test_planner $(BUILD_DIR)/test_hyperloglog $(BUILD_DIR)/test_kll_sketch $(BUILD_DIR)/test_frequency_sketch
 	./$(BUILD_DIR)/test_smoke
 	./$(BUILD_DIR)/test_planner
 	./$(BUILD_DIR)/test_hyperloglog
 	./$(BUILD_DIR)/test_kll_sketch
+	./$(BUILD_DIR)/test_frequency_sketch
 
 $(BUILD_DIR)/bench_count_distinct.o: tests/bench_count_distinct.cpp include/sketchydb.h | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
@@ -111,6 +121,15 @@ $(BUILD_DIR)/bench_quantiles: $(BUILD_DIR)/bench_quantiles.o $(BUILD_DIR)/libske
 
 perf_kll: $(BUILD_DIR)/bench_quantiles
 	SKDB_HASH_SEED="$(SKDB_HASH_SEED)" ./$(BUILD_DIR)/bench_quantiles $(PERF_TRIALS) $(PERF_ROWS) $(PERF_DISTINCT) $(PERF_BATCH_SIZE) $(PERF_SEED)
+
+$(BUILD_DIR)/bench_frequency.o: tests/bench_frequency.cpp include/sketchydb.h | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/bench_frequency: $(BUILD_DIR)/bench_frequency.o $(BUILD_DIR)/libsketchydb.a
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+perf_freq: $(BUILD_DIR)/bench_frequency
+	SKDB_HASH_SEED="$(SKDB_HASH_SEED)" ./$(BUILD_DIR)/bench_frequency $(PERF_TRIALS) $(PERF_ROWS) $(PERF_DISTINCT) $(PERF_BATCH_SIZE) $(PERF_SEED)
 
 clean:
 	rm -rf build
